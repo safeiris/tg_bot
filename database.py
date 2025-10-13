@@ -229,6 +229,29 @@ def register_participant(participant: Participant) -> None:
         worksheet.append_row(row_values)
 
 
+def get_participant(chat_id: int) -> Optional[Dict[str, str]]:
+    """Return participant row mapped by headers or ``None`` if missing."""
+
+    worksheet = get_current_worksheet()
+    header_map = _header_map(worksheet)
+    row_idx = _find_row_by_chat_id(worksheet, chat_id, header_map)
+    if not row_idx:
+        return None
+    return _row_dict(worksheet, row_idx, header_map)
+
+
+def unregister_participant(chat_id: int) -> bool:
+    """Remove participant from the current worksheet."""
+
+    worksheet = get_current_worksheet()
+    header_map = _header_map(worksheet)
+    row_idx = _find_row_by_chat_id(worksheet, chat_id, header_map)
+    if not row_idx:
+        return False
+    worksheet.delete_rows(row_idx)
+    return True
+
+
 def update_participation(chat_id: int, role: str, paid: str) -> None:
     worksheet = get_current_worksheet()
     header_map = _header_map(worksheet)
@@ -299,6 +322,17 @@ def export_database(destination: Optional[Path] = None) -> Path:
         destination = DATA_DIR / "participants.xlsx"
     destination.parent.mkdir(parents=True, exist_ok=True)
     df.to_excel(destination, index=False)
+    return destination
+
+
+def export_database_csv(destination: Optional[Path] = None) -> Path:
+    """Create a CSV export of the current participant list."""
+
+    df = get_participants()
+    if destination is None:
+        destination = DATA_DIR / "participants.csv"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(destination, index=False)
     return destination
 
 

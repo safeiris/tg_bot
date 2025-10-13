@@ -1,7 +1,12 @@
 {
-  "topic": "Название 1",
-  "description": "Слет агрономов",
-  "event_datetime": "2025-10-24T15:56:00",
-  "zoom_link": "https://dzen.ru/?yredirect=true",
-  "payment_link": ""
+  "topic": "Встреча сибирский котов",
+  "description": "Сибиркие коты давно не виделись, давайте обсудим последние новости",
+  "current_event_id": "435cb57f8475",
+  "current_event_sheet_name": "17-10-2025__sobranie-sibirskikh-kotov",
+  "current_event_sheet_gid": 927329358,
+  "current_event_datetime": "2025-10-17T15:55:00+03:00",
+  "zoom_link": "https://www.youtube.com/",
+  "payment_link": "https://mail.google.com/mail/u/0/#inbox",
+  "timezone": "Europe/Moscow",
+  "event_datetime": "2025-10-24T15:56:00"
 }

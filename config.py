@@ -31,6 +31,7 @@ SETTINGS_FILE = DATA_DIR / "config.json"
 _DEFAULT_SETTINGS: Dict[str, Any] = {
     "topic": "Психологический вебинар",
     "description": "Авторский вебинар по психологии",
+    "welcome_text": "Добро пожаловать! Здесь вы можете зарегистрироваться на ближайшее мероприятие.",
     "current_event_id": None,
     "current_event_sheet_name": None,
     "current_event_sheet_gid": None,
