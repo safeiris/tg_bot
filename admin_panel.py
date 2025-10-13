@@ -10,7 +10,6 @@ from uuid import uuid4
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
-    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     ConversationHandler,
@@ -18,6 +17,8 @@ from telegram.ext import (
     filters,
 )
 from zoneinfo import ZoneInfo
+
+_conversation_handler: ConversationHandler | None = None
 
 import database
 from config import TIMEZONE, is_admin, load_settings, update_settings
@@ -46,7 +47,7 @@ CALLBACK_EDIT_DATETIME = "admin:edit_datetime"
 CALLBACK_UPDATE_ZOOM = "admin:update_zoom"
 CALLBACK_UPDATE_PAYMENT = "admin:update_payment"
 CALLBACK_LIST_PARTICIPANTS = "admin:list_participants"
-CALLBACK_EXPORT_CSV = "admin:export_csv"
+CALLBACK_OPEN_SHEET = "admin:open_sheet"
 CALLBACK_REMIND_ALL = "admin:remind_all"
 
 TZ = ZoneInfo(TIMEZONE)
@@ -88,7 +89,7 @@ def _build_admin_keyboard() -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton(
-                "📥 Экспорт CSV", callback_data=CALLBACK_EXPORT_CSV
+                "📄 Просмотр участников", callback_data=CALLBACK_OPEN_SHEET
             ),
             InlineKeyboardButton(
                 "📣 Напомнить всем", callback_data=CALLBACK_REMIND_ALL
@@ -222,6 +223,16 @@ async def show_admin_panel(
             disable_web_page_preview=True,
         )
         context.user_data["admin_panel_message_id"] = sent.message_id
+
+
+def _update_conversation_state(update: Update, new_state: object) -> None:
+    if _conversation_handler is None:
+        return
+    try:
+        key = _conversation_handler._get_key(update)  # type: ignore[attr-defined]
+    except RuntimeError:
+        return
+    _conversation_handler._update_state(new_state, key)  # type: ignore[attr-defined]
 
 
 async def admin_command_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -392,6 +403,26 @@ async def _handle_list_participants(
     return ADMIN_PANEL
 
 
+async def _handle_open_sheet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.callback_query:
+        await update.callback_query.answer()
+    try:
+        link = database.get_sheet_link()
+    except RuntimeError:
+        await show_admin_panel(
+            update,
+            context,
+            status_message="Ссылка на список участников недоступна. Настройте активное мероприятие.",
+        )
+        return ADMIN_PANEL
+    await show_admin_panel(
+        update,
+        context,
+        status_message=f"Ссылка на участников: {link}",
+    )
+    return ADMIN_PANEL
+
+
 async def _handle_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if update.callback_query:
         await update.callback_query.answer()
@@ -401,25 +432,6 @@ async def _handle_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         status_message="Введите текст напоминания, который получат все участники.",
     )
     return WAITING_BROADCAST
-
-
-async def _handle_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    try:
-        path = database.export_database_csv()
-    except RuntimeError:
-        await show_admin_panel(
-            update,
-            context,
-            status_message="Не удалось экспортировать: активное мероприятие не настроено.",
-        )
-        return ADMIN_PANEL
-    await update.effective_chat.send_document(document=path.read_bytes(), filename=path.name)
-    await show_admin_panel(
-        update,
-        context,
-        status_message="CSV-файл со списком участников отправлен.",
-    )
-    return ADMIN_PANEL
 
 
 async def _handle_new_event(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -440,30 +452,35 @@ async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
         return ADMIN_PANEL
     if not await _ensure_admin(update):
         await query.answer()
-        return ConversationHandler.END
+        new_state = ConversationHandler.END
+        _update_conversation_state(update, new_state)
+        return new_state
     data = query.data
     if data == CALLBACK_NEW_EVENT:
-        return await _handle_new_event(update, context)
-    if data == CALLBACK_SHOW_EVENT:
-        return await _handle_show_event(update, context)
-    if data == CALLBACK_EDIT_DESCRIPTION:
-        return await _handle_edit_description(update, context)
-    if data == CALLBACK_EDIT_TITLE:
-        return await _handle_edit_title(update, context)
-    if data == CALLBACK_EDIT_DATETIME:
-        return await _handle_edit_datetime(update, context)
-    if data == CALLBACK_UPDATE_ZOOM:
-        return await _handle_update_zoom(update, context)
-    if data == CALLBACK_UPDATE_PAYMENT:
-        return await _handle_update_payment(update, context)
-    if data == CALLBACK_LIST_PARTICIPANTS:
-        return await _handle_list_participants(update, context)
-    if data == CALLBACK_EXPORT_CSV:
-        return await _handle_export(update, context)
-    if data == CALLBACK_REMIND_ALL:
-        return await _handle_broadcast(update, context)
-    await query.answer()
-    return ADMIN_PANEL
+        new_state = await _handle_new_event(update, context)
+    elif data == CALLBACK_SHOW_EVENT:
+        new_state = await _handle_show_event(update, context)
+    elif data == CALLBACK_EDIT_DESCRIPTION:
+        new_state = await _handle_edit_description(update, context)
+    elif data == CALLBACK_EDIT_TITLE:
+        new_state = await _handle_edit_title(update, context)
+    elif data == CALLBACK_EDIT_DATETIME:
+        new_state = await _handle_edit_datetime(update, context)
+    elif data == CALLBACK_UPDATE_ZOOM:
+        new_state = await _handle_update_zoom(update, context)
+    elif data == CALLBACK_UPDATE_PAYMENT:
+        new_state = await _handle_update_payment(update, context)
+    elif data == CALLBACK_LIST_PARTICIPANTS:
+        new_state = await _handle_list_participants(update, context)
+    elif data == CALLBACK_OPEN_SHEET:
+        new_state = await _handle_open_sheet(update, context)
+    elif data == CALLBACK_REMIND_ALL:
+        new_state = await _handle_broadcast(update, context)
+    else:
+        await query.answer()
+        new_state = ADMIN_PANEL
+    _update_conversation_state(update, new_state)
+    return new_state
 
 
 async def handle_broadcast_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -670,10 +687,11 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 def build_admin_conversation() -> ConversationHandler:
-    return ConversationHandler(
+    global _conversation_handler
+    conversation = ConversationHandler(
         entry_points=[CommandHandler("admin", admin_command_entry)],
         states={
-            ADMIN_PANEL: [CallbackQueryHandler(handle_admin_callback, pattern=r"^admin:")],
+            ADMIN_PANEL: [],
             WAITING_BROADCAST: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_broadcast_text)
             ],
@@ -709,3 +727,5 @@ def build_admin_conversation() -> ConversationHandler:
         fallbacks=[CommandHandler("cancel", cancel)],
         allow_reentry=True,
     )
+    _conversation_handler = conversation
+    return conversation

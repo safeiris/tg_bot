@@ -1,12 +1,16 @@
 """Entry point for the psychology webinar Telegram bot."""
 from __future__ import annotations
 
-from telegram.ext import Application, MessageHandler, filters
+from telegram.ext import Application, CallbackQueryHandler, MessageHandler, filters
 
 import config
 import database
-from admin_panel import build_admin_conversation
-from handlers import build_conversation_handler, feedback_handler
+from admin_panel import build_admin_conversation, handle_admin_callback
+from handlers import (
+    build_conversation_handler,
+    feedback_handler,
+    handle_user_callback,
+)
 from scheduler import ensure_scheduler_started, schedule_all_reminders
 
 
@@ -22,6 +26,8 @@ def main() -> None:
 
     application.add_handler(build_conversation_handler())
     application.add_handler(build_admin_conversation())
+    application.add_handler(CallbackQueryHandler(handle_admin_callback, pattern=r"^admin:"))
+    application.add_handler(CallbackQueryHandler(handle_user_callback, pattern=r"^user:"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, feedback_handler))
 
     application.run_polling()

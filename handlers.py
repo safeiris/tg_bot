@@ -8,7 +8,6 @@ from typing import Optional
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
-    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     ConversationHandler,
@@ -26,6 +25,18 @@ from zoneinfo import ZoneInfo
 EMAIL_REGEX = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 PANEL, WAITING_EMAIL, WAITING_FEEDBACK = range(3)
+
+_conversation_handler: ConversationHandler | None = None
+
+
+def _update_conversation_state(update: Update, new_state: object) -> None:
+    if _conversation_handler is None:
+        return
+    try:
+        key = _conversation_handler._get_key(update)  # type: ignore[attr-defined]
+    except RuntimeError:
+        return
+    _conversation_handler._update_state(new_state, key)  # type: ignore[attr-defined]
 
 USER_REGISTER = "user:register"
 USER_REMIND_HOUR = "user:remind:hour"
@@ -413,24 +424,28 @@ async def _handle_calendar(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 async def handle_user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     data = update.callback_query.data if update.callback_query else ""
+    new_state = PANEL
     if data == USER_REGISTER:
-        return await _handle_registration(update, context)
-    if data == USER_REMIND_DAY:
-        return await _handle_reminder(update, context, REMINDER_DAY)
-    if data == USER_REMIND_HOUR:
-        return await _handle_reminder(update, context, REMINDER_HOUR)
-    if data == USER_UNSUBSCRIBE:
-        return await _handle_unsubscribe(update, context)
-    if data == USER_CONFIRMED_PAYMENT:
-        return await _handle_payment_confirmation(update, context)
-    if data == USER_FEEDBACK:
-        return await _handle_feedback(update, context)
-    if data == USER_LOCATION:
-        return await _handle_location(update, context)
-    if data == USER_CALENDAR:
-        return await _handle_calendar(update, context)
-    await update.callback_query.answer()
-    return PANEL
+        new_state = await _handle_registration(update, context)
+    elif data == USER_REMIND_DAY:
+        new_state = await _handle_reminder(update, context, REMINDER_DAY)
+    elif data == USER_REMIND_HOUR:
+        new_state = await _handle_reminder(update, context, REMINDER_HOUR)
+    elif data == USER_UNSUBSCRIBE:
+        new_state = await _handle_unsubscribe(update, context)
+    elif data == USER_CONFIRMED_PAYMENT:
+        new_state = await _handle_payment_confirmation(update, context)
+    elif data == USER_FEEDBACK:
+        new_state = await _handle_feedback(update, context)
+    elif data == USER_LOCATION:
+        new_state = await _handle_location(update, context)
+    elif data == USER_CALENDAR:
+        new_state = await _handle_calendar(update, context)
+    else:
+        if update.callback_query:
+            await update.callback_query.answer()
+    _update_conversation_state(update, new_state)
+    return new_state
 
 
 async def handle_email(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -513,10 +528,11 @@ async def feedback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 def build_conversation_handler() -> ConversationHandler:
-    return ConversationHandler(
+    global _conversation_handler
+    conversation = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
-            PANEL: [CallbackQueryHandler(handle_user_callback, pattern=r"^user:")],
+            PANEL: [],
             WAITING_EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_email)],
             WAITING_FEEDBACK: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_feedback_text)
@@ -525,3 +541,5 @@ def build_conversation_handler() -> ConversationHandler:
         fallbacks=[CommandHandler("cancel", cancel)],
         allow_reentry=True,
     )
+    _conversation_handler = conversation
+    return conversation
