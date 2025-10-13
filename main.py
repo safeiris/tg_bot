@@ -20,6 +20,7 @@ from admin_panel import admin_command_entry, handle_admin_callback, handle_admin
 from handlers import (
     build_conversation_handler,
     feedback_handler,
+    go_main_menu,
     handle_user_callback,
 )
 from events import events_bootstrap
@@ -76,6 +77,10 @@ def main() -> None:
     application = Application.builder().token(config.BOT_TOKEN).build()
     application.post_init = _post_init
 
+    application.add_handler(
+        CallbackQueryHandler(go_main_menu, pattern=r"^nav:main$", block=True),
+        group=-1,
+    )
     application.add_handler(build_conversation_handler())
     application.add_handler(CommandHandler("admin", admin_command_entry))
     application.add_handler(CallbackQueryHandler(handle_admin_callback, pattern=r"^(?:admin:|nav:back$)"))

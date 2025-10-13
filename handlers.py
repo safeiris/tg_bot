@@ -23,6 +23,8 @@ from notifications import send_paid_confirmation
 from reminders import cancel_personal_reminder, schedule_personal_reminder
 from zoneinfo import ZoneInfo
 
+from admin_panel import show_main_menu
+
 EMAIL_REGEX = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 PANEL, WAITING_EMAIL, WAITING_FEEDBACK = range(3)
@@ -31,6 +33,43 @@ _conversation_handler: ConversationHandler | None = None
 
 
 logger = logging.getLogger(__name__)
+
+
+async def go_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Global handler that always returns the admin panel to the main menu."""
+
+    query = update.callback_query
+    if query:
+        try:
+            await query.answer()
+        except Exception:
+            logger.debug("Failed to answer nav:main callback", exc_info=True)
+
+    # Reset any pending input states
+    context.user_data.pop("await", None)
+    context.user_data.pop("draft_event", None)
+    context.user_data.pop("event_wizard_state", None)
+
+    # Close lingering wizard panel if possible
+    chat = update.effective_chat
+    wizard_message_id = context.user_data.pop("wizard_message_id", None)
+    if chat and wizard_message_id:
+        try:
+            await context.bot.delete_message(
+                chat_id=chat.id, message_id=wizard_message_id
+            )
+        except Exception:
+            logger.debug("Failed to delete wizard message", exc_info=True)
+
+    # Ensure navigation stack is reset to the main screen
+    stack = context.user_data.setdefault("admin_nav_stack", [])
+    if isinstance(stack, list):
+        stack.clear()
+        stack.append({"screen": "main", "data": {}})
+    else:
+        context.user_data["admin_nav_stack"] = [{"screen": "main", "data": {}}]
+
+    await show_main_menu(update, context, status_message=None)
 
 
 def _update_conversation_state(update: Update, new_state: object) -> None:
