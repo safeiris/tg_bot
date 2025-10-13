@@ -5,7 +5,7 @@ import html
 import logging
 import re
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
@@ -20,10 +20,12 @@ from events import (
     create_event,
     events_bootstrap,
     events_refresh_if_stale,
+    get_active_event,
     get_current_event,
     get_current_event_id,
     get_event,
     get_events_page,
+    has_active_event,
     open_sheet_url,
     set_current_event,
     update_event,
@@ -32,14 +34,16 @@ from scheduler import ensure_scheduler_started, schedule_all_reminders
 
 TZ = ZoneInfo(TIMEZONE)
 PAGE_SIZE = 5
-TIMEZONE_PRESETS: List[Tuple[str, str]] = [
-    ("Europe/Moscow", "Europe/Moscow (UTC+3)"),
-    ("Europe/Kaliningrad", "Europe/Kaliningrad (UTC+2)"),
-    ("Europe/Berlin", "Europe/Berlin (UTC+1/+2)"),
-    ("Asia/Almaty", "Asia/Almaty (UTC+6)"),
-    ("Asia/Vladivostok", "Asia/Vladivostok (UTC+10)"),
-    ("UTC", "UTC"),
-]
+WIZARD_STEP_TITLE = "title"
+WIZARD_STEP_DATETIME = "datetime"
+WIZARD_STEP_ZOOM = "zoom"
+WIZARD_STEP_PAY = "pay"
+WIZARD_STEP_READY = "ready"
+
+ACTIVE_EVENT_WARNING = (
+    "⚠️ Пока есть активное мероприятие.\n"
+    "Дождись окончания текущего, чтобы создать новое 💗"
+)
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +88,7 @@ def _pop_entry(context: ContextTypes.DEFAULT_TYPE) -> Optional[Dict[str, object]
 
 def _clear_draft(context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.pop("draft_event", None)
+    context.user_data.pop("event_wizard_state", None)
 
 
 def _clear_await(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -274,14 +279,16 @@ def _format_event_card(event: Optional[Event], status_message: Optional[str] = N
     return "\n".join(lines)
 
 
-def _main_menu_keyboard() -> InlineKeyboardMarkup:
-    keyboard = [
-        [InlineKeyboardButton("🆕 Новое мероприятие", callback_data="admin:menu:new")],
-        [InlineKeyboardButton("📅 Мои мероприятия", callback_data="admin:menu:list")],
-        [InlineKeyboardButton("📄 Просмотр участников", callback_data="admin:menu:participants")],
-        [InlineKeyboardButton("📣 Напомнить всем", callback_data="admin:menu:remind")],
-    ]
-    return InlineKeyboardMarkup(_add_home_button(keyboard))
+def _main_menu_keyboard(active_event: Optional[Event]) -> InlineKeyboardMarkup:
+    rows: List[List[InlineKeyboardButton]] = []
+    if active_event:
+        rows.append([InlineKeyboardButton("🛠 Управление текущим", callback_data="admin:menu:manage")])
+    else:
+        rows.append([InlineKeyboardButton("🆕 Новое мероприятие", callback_data="admin:menu:new")])
+    rows.append([InlineKeyboardButton("📅 Мои мероприятия", callback_data="admin:menu:list")])
+    rows.append([InlineKeyboardButton("📄 Просмотр участников", callback_data="admin:menu:participants")])
+    rows.append([InlineKeyboardButton("📣 Напомнить всем", callback_data="admin:menu:remind")])
+    return InlineKeyboardMarkup(_add_home_button(rows))
 
 
 async def _show_main_menu(
@@ -290,9 +297,10 @@ async def _show_main_menu(
     *,
     status_message: Optional[str] = None,
 ) -> None:
-    event = get_current_event()
+    active_event = get_active_event()
+    event = active_event or get_current_event()
     text = _format_event_card(event, status_message)
-    await _send_panel(update, context, text, _main_menu_keyboard())
+    await _send_panel(update, context, text, _main_menu_keyboard(active_event))
 
 
 async def show_main_menu(
@@ -402,7 +410,6 @@ def _draft(context: ContextTypes.DEFAULT_TYPE) -> Dict[str, object]:
         "draft_event",
         {
             "title": "",
-            "description": "",
             "datetime": None,
             "timezone": TIMEZONE,
             "zoom_url": "",
@@ -419,7 +426,7 @@ def _format_draft_datetime(draft: Dict[str, object]) -> str:
     if not dt:
         return "❗️Не указано"
     tz = draft.get("timezone") or TIMEZONE
-    return _format_event_datetime(
+    formatted = _format_event_datetime(
         Event(
             event_id="draft",
             title="",
@@ -435,36 +442,86 @@ def _format_draft_datetime(draft: Dict[str, object]) -> str:
             updated_at="",
         )
     )
+    return f"{formatted} ({tz})"
 
 
-def _draft_text(draft: Dict[str, object], status_message: Optional[str] = None) -> str:
+def _wizard_state(context: ContextTypes.DEFAULT_TYPE) -> Dict[str, object]:
+    state = context.user_data.setdefault(
+        "event_wizard_state", {"step": WIZARD_STEP_TITLE}
+    )
+    step = state.get("step")
+    if step not in {
+        WIZARD_STEP_TITLE,
+        WIZARD_STEP_DATETIME,
+        WIZARD_STEP_ZOOM,
+        WIZARD_STEP_PAY,
+        WIZARD_STEP_READY,
+    }:
+        state["step"] = WIZARD_STEP_TITLE
+    return state
+
+
+def _wizard_current_step(context: ContextTypes.DEFAULT_TYPE) -> str:
+    state = _wizard_state(context)
+    return str(state.get("step") or WIZARD_STEP_TITLE)
+
+
+def _set_wizard_step(context: ContextTypes.DEFAULT_TYPE, step: str) -> None:
+    state = _wizard_state(context)
+    state["step"] = step
+
+
+def _wizard_prompt(step: str) -> Optional[str]:
+    prompts = {
+        WIZARD_STEP_TITLE: "Введи название встречи.",
+        WIZARD_STEP_DATETIME: "Введи дату и время в формате ДД.ММ.ГГГГ ЧЧ:ММ.",
+        WIZARD_STEP_ZOOM: "Вставь ссылку на Zoom (или нажми Пропустить).",
+        WIZARD_STEP_PAY: "Вставь ссылку на оплату (или нажми Пропустить).",
+        WIZARD_STEP_READY: "Нажми «✅ Завершить и создать», чтобы сохранить мероприятие.",
+    }
+    return prompts.get(step)
+
+
+def _wizard_ready(draft: Dict[str, object]) -> bool:
+    return bool(draft.get("title") and draft.get("datetime"))
+
+
+def _draft_text(
+    draft: Dict[str, object],
+    step: str,
+    status_message: Optional[str] = None,
+) -> str:
     lines = ["🛠 Создание мероприятия"]
     lines.append(f"📛 Название: {html.escape((draft.get('title') or '').strip() or '—')}")
-    desc = (draft.get("description") or "").strip() or "—"
-    lines.append(f"📝 Описание: {html.escape(desc)}")
-    lines.append(f"📅 Дата и время: {html.escape(_format_draft_datetime(draft))}")
-    lines.append(f"🌍 Часовой пояс: {html.escape(str(draft.get('timezone') or TIMEZONE))}")
+    lines.append(f"📅 Дата/время: {html.escape(_format_draft_datetime(draft))}")
     zoom = (draft.get("zoom_url") or "").strip() or "—"
     lines.append(f"🔗 Zoom: {html.escape(zoom)}")
     pay = (draft.get("pay_url") or "").strip() or "—"
     lines.append(f"💳 Оплата: {html.escape(pay)}")
+    prompt = _wizard_prompt(step)
+    if prompt:
+        lines.append("")
+        lines.append(prompt)
     if status_message:
         lines.append("")
         lines.append(status_message)
     return "\n".join(lines)
 
 
-def _new_event_keyboard(ready: bool) -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton("📛 Название", callback_data="admin:new:title")],
-        [InlineKeyboardButton("📝 Описание", callback_data="admin:new:desc")],
-        [InlineKeyboardButton("📅 Дата и время", callback_data="admin:new:dt")],
-        [InlineKeyboardButton("🔗 Zoom", callback_data="admin:new:zoom")],
-        [InlineKeyboardButton("💳 Оплата", callback_data="admin:new:pay")],
-        [InlineKeyboardButton("🌍 Часовой пояс", callback_data="admin:new:tz")],
-    ]
-    rows.append([InlineKeyboardButton("✅ Завершить и создать", callback_data="admin:new:confirm")])
-    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="nav:back")])
+def _new_event_keyboard(ready: bool, step: str) -> InlineKeyboardMarkup:
+    rows: List[List[InlineKeyboardButton]] = []
+    if step == WIZARD_STEP_ZOOM:
+        rows.append([
+            InlineKeyboardButton("⏭ Пропустить", callback_data="admin:new:skip_zoom")
+        ])
+    if step == WIZARD_STEP_PAY:
+        rows.append([
+            InlineKeyboardButton("⏭ Пропустить", callback_data="admin:new:skip_pay")
+        ])
+    if ready:
+        rows.append([
+            InlineKeyboardButton("✅ Завершить и создать", callback_data="admin:new:create")
+        ])
     return InlineKeyboardMarkup(_add_home_button(rows))
 
 
@@ -475,51 +532,50 @@ async def _show_new_event(
     status_message: Optional[str] = None,
 ) -> None:
     draft = _draft(context)
-    ready = bool(draft.get("title") and draft.get("datetime"))
-    text = _draft_text(draft, status_message)
+    step = _wizard_current_step(context)
+    ready = _wizard_ready(draft)
+    text = _draft_text(draft, step, status_message)
     _replace_top(context, "new")
-    await _send_wizard_panel(update, context, text, _new_event_keyboard(ready))
+    await _send_wizard_panel(update, context, text, _new_event_keyboard(ready, step))
 
 
-async def _show_timezone_picker(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+async def _prompt_wizard_step(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    draft = _draft(context)
-    current = str(draft.get("timezone") or TIMEZONE)
-    rows = [
-        [
-            InlineKeyboardButton(
-                ("✅ " if current == tz else "") + label,
-                callback_data=f"admin:new:tzset:{tz}",
-            )
-        ]
-        for tz, label in TIMEZONE_PRESETS
-    ]
-    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="nav:back")])
-    text = "Выберите часовой пояс"
-    _replace_top(context, "new_tz")
-    await _send_wizard_panel(
-        update, context, text, InlineKeyboardMarkup(_add_home_button(rows))
-    )
+    prompt = _wizard_prompt(_wizard_current_step(context))
+    if not prompt:
+        return
+    chat = update.effective_chat
+    if not chat:
+        return
+    try:
+        await context.bot.send_message(chat_id=chat.id, text=prompt)
+    except Exception:
+        logger.debug("Failed to deliver wizard prompt", exc_info=True)
 
 
-async def _show_new_confirm(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
+async def _send_active_event_warning(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    draft = _draft(context)
-    text = _draft_text(draft, "Проверьте данные и подтвердите создание.")
-    keyboard = InlineKeyboardMarkup(
-        _add_home_button(
-            [
-                [InlineKeyboardButton("✅ Создать", callback_data="admin:new:create")],
-                [InlineKeyboardButton("⬅️ Назад", callback_data="nav:back")],
-            ]
-        )
-    )
-    _replace_top(context, "new_confirm")
-    await _send_wizard_panel(update, context, text, keyboard)
+    chat = update.effective_chat
+    if chat is not None:
+        try:
+            await context.bot.send_message(chat_id=chat.id, text=ACTIVE_EVENT_WARNING)
+        except Exception:
+            logger.debug("Failed to send active-event warning", exc_info=True)
+    await _show_main_menu(update, context, status_message=ACTIVE_EVENT_WARNING)
+
+
+async def _ensure_no_active_event(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> bool:
+    if not has_active_event():
+        return True
+    await _close_wizard_panel(update, context)
+    _clear_draft(context)
+    _clear_await(context)
+    await _send_active_event_warning(update, context)
+    return False
 
 
 def _format_event_detail(event: Event, status_message: Optional[str] = None) -> str:
@@ -533,16 +589,24 @@ def _format_event_detail(event: Event, status_message: Optional[str] = None) -> 
 
 def _event_menu_keyboard(event: Event) -> InlineKeyboardMarkup:
     base = f"admin:ev:{event.event_id}"
-    rows = [
-        [InlineKeyboardButton("✏️ Изменить название", callback_data=f"{base}:edit_title")],
-        [InlineKeyboardButton("📝 Изменить описание", callback_data=f"{base}:edit_desc")],
-        [InlineKeyboardButton("📅 Изменить дату и время", callback_data=f"{base}:edit_dt")],
-        [InlineKeyboardButton("🔗 Обновить Zoom", callback_data=f"{base}:edit_zoom")],
-        [InlineKeyboardButton("💳 Обновить оплату", callback_data=f"{base}:edit_pay")],
-        [InlineKeyboardButton("📄 Просмотреть участников", callback_data=f"{base}:open_sheet")],
-        [InlineKeyboardButton("🗑 Отменить мероприятие", callback_data=f"{base}:cancel")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data=f"{base}:back")],
-    ]
+    status = classify_status(event)
+    rows: List[List[InlineKeyboardButton]]
+    if status == "active":
+        rows = [
+            [InlineKeyboardButton("✏️ Изменить название", callback_data=f"{base}:edit_title")],
+            [InlineKeyboardButton("📝 Изменить описание", callback_data=f"{base}:edit_desc")],
+            [InlineKeyboardButton("📅 Изменить дату и время", callback_data=f"{base}:edit_dt")],
+            [InlineKeyboardButton("🔗 Обновить Zoom", callback_data=f"{base}:edit_zoom")],
+            [InlineKeyboardButton("💳 Обновить оплату", callback_data=f"{base}:edit_pay")],
+            [InlineKeyboardButton("📄 Просмотреть участников", callback_data=f"{base}:open_sheet")],
+            [InlineKeyboardButton("🗑 Отменить мероприятие", callback_data=f"{base}:cancel")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data=f"{base}:back")],
+        ]
+    else:
+        rows = [
+            [InlineKeyboardButton("📄 Просмотреть участников", callback_data=f"{base}:open_sheet")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data=f"{base}:back")],
+        ]
     return InlineKeyboardMarkup(_add_home_button(rows))
 
 
@@ -605,72 +669,50 @@ async def _handle_new_event_callback(
 ) -> None:
     if update.callback_query:
         await update.callback_query.answer()
-    if data == "admin:new:title":
-        _clear_await(context)
-        context.user_data["await"] = {"type": "new_title"}
-        await _show_new_event(update, context, status_message="Введите название мероприятия текстом.")
+    if not await _ensure_no_active_event(update, context):
         return
-    if data == "admin:new:desc":
-        _clear_await(context)
-        context.user_data["await"] = {"type": "new_desc"}
-        await _show_new_event(update, context, status_message="Отправьте описание мероприятия.")
-        return
-    if data == "admin:new:dt":
+    chat = update.effective_chat
+    if data == "admin:new:skip_zoom":
         draft = _draft(context)
-        tz = draft.get("timezone") or TIMEZONE
-        _clear_await(context)
-        context.user_data["await"] = {"type": "new_dt", "timezone": tz}
-        await _show_new_event(
-            update,
-            context,
-            status_message="Укажите дату и время в формате ДД.ММ.ГГГГ ЧЧ:ММ",
-        )
+        draft["zoom_url"] = ""
+        _set_wizard_step(context, WIZARD_STEP_PAY)
+        context.user_data["await"] = {"type": "wizard", "step": WIZARD_STEP_PAY}
+        if chat is not None:
+            try:
+                await context.bot.send_message(chat_id=chat.id, text="⏭ Zoom пропущен.")
+            except Exception:
+                logger.debug("Failed to send zoom skip confirmation", exc_info=True)
+        await _show_new_event(update, context)
+        await _prompt_wizard_step(update, context)
         return
-    if data == "admin:new:zoom":
-        _clear_await(context)
-        context.user_data["await"] = {"type": "new_zoom"}
-        await _show_new_event(update, context, status_message="Отправьте ссылку Zoom или пустое сообщение.")
-        return
-    if data == "admin:new:pay":
-        _clear_await(context)
-        context.user_data["await"] = {"type": "new_pay"}
-        await _show_new_event(update, context, status_message="Отправьте ссылку на оплату или пустое сообщение.")
-        return
-    if data == "admin:new:tz":
-        _clear_await(context)
-        _push_entry(context, "new_tz")
-        await _show_timezone_picker(update, context)
-        return
-    if data.startswith("admin:new:tzset:"):
-        tz = data.split(":", 3)[3]
+    if data == "admin:new:skip_pay":
         draft = _draft(context)
-        draft["timezone"] = tz
-        _pop_entry(context)
-        await _show_new_event(update, context, status_message=f"Часовой пояс установлен: {tz}")
-        return
-    if data == "admin:new:confirm":
-        draft = _draft(context)
-        if not draft.get("title") or not draft.get("datetime"):
-            await _show_new_event(update, context, status_message="Укажите название и дату.")
-            return
+        draft["pay_url"] = ""
+        _set_wizard_step(context, WIZARD_STEP_READY)
         _clear_await(context)
-        _push_entry(context, "new_confirm")
-        await _show_new_confirm(update, context)
+        if chat is not None:
+            try:
+                await context.bot.send_message(chat_id=chat.id, text="⏭ Оплата пропущена.")
+            except Exception:
+                logger.debug("Failed to send payment skip confirmation", exc_info=True)
+        await _show_new_event(update, context)
+        await _prompt_wizard_step(update, context)
         return
     if data == "admin:new:create":
         draft = _draft(context)
         title = (draft.get("title") or "").strip()
         dt: Optional[datetime] = draft.get("datetime")
         if not title or not dt:
-            await _show_new_event(update, context, status_message="Недостаточно данных для создания.")
+            await _show_new_event(
+                update, context, status_message="Недостаточно данных для создания."
+            )
             return
-        description = (draft.get("description") or "").strip()
         timezone = str(draft.get("timezone") or TIMEZONE)
         zoom_url = (draft.get("zoom_url") or "").strip()
         pay_url = (draft.get("pay_url") or "").strip()
         event = create_event(
             title=title,
-            description=description,
+            description="",
             event_dt=dt,
             timezone=timezone,
             zoom_url=zoom_url,
@@ -682,16 +724,41 @@ async def _handle_new_event_callback(
             events_bootstrap(context.application.bot_data if context.application else None)
         except Exception:
             logger.exception("Failed to refresh events index after creation")
-        await _close_wizard_panel(update, context)
-        _clear_draft(context)
+        formatted_dt = html.escape(_format_event_datetime(event))
+        tz_label = html.escape(event.timezone or TIMEZONE)
+        zoom_text = html.escape(event.zoom_url or "—")
+        pay_text = html.escape(event.pay_url or "—")
+        sheet_text = html.escape(event.sheet_link or "—")
+        summary_lines = [
+            "🎉 Встреча успешно создана!",
+            "",
+            f"📛 Название: {html.escape(event.title or '—')}",
+            f"📅 Дата/время: {formatted_dt} ({tz_label})",
+            f"🔗 Zoom: {zoom_text}",
+            f"💳 Оплата: {pay_text}",
+            f"📄 Участники: {sheet_text}",
+            "",
+            "Что дальше?",
+        ]
+        keyboard = InlineKeyboardMarkup(
+            _add_home_button(
+                [
+                    [InlineKeyboardButton("🛠 Управление текущим", callback_data="admin:menu:manage")],
+                    [InlineKeyboardButton("📣 Напомнить всем", callback_data="admin:menu:remind")],
+                    [
+                        InlineKeyboardButton(
+                            "📄 Просмотр участников", callback_data="admin:menu:participants"
+                        )
+                    ],
+                ]
+            )
+        )
+        await _send_wizard_panel(update, context, "\n".join(summary_lines), keyboard)
         _clear_await(context)
+        _clear_draft(context)
         _reset_stack(context)
         _push_entry(context, "main")
-        await _show_main_menu(
-            update,
-            context,
-            status_message=f"Мероприятие создано: {html.escape(event.title)}",
-        )
+        await _show_main_menu(update, context)
         return
 
 
@@ -707,20 +774,32 @@ async def _handle_event_callback(
         _pop_entry(context)
         await _show_event_list(update, context, page=1)
         return
+    event = get_event(event_id)
+    if not event:
+        await _show_event_list(update, context, page=1, status_message="Событие не найдено.")
+        return
+    status = classify_status(event)
+    editable = status == "active"
+    view_only_message = "⚠️ Это мероприятие уже прошло.\nЕго можно только просмотреть 💗"
     if action == "edit_title":
+        if not editable:
+            await _show_event_menu(update, context, event_id, status_message=view_only_message)
+            return
         _clear_await(context)
         context.user_data["await"] = {"type": "ev_edit_title", "event_id": event_id}
         await _show_event_menu(update, context, event_id, status_message="Введите новое название.")
         return
     if action == "edit_desc":
+        if not editable:
+            await _show_event_menu(update, context, event_id, status_message=view_only_message)
+            return
         _clear_await(context)
         context.user_data["await"] = {"type": "ev_edit_desc", "event_id": event_id}
         await _show_event_menu(update, context, event_id, status_message="Введите новое описание.")
         return
     if action == "edit_dt":
-        event = get_event(event_id)
-        if not event:
-            await _show_event_list(update, context, page=1, status_message="Событие не найдено.")
+        if not editable:
+            await _show_event_menu(update, context, event_id, status_message=view_only_message)
             return
         _clear_await(context)
         context.user_data["await"] = {
@@ -736,11 +815,17 @@ async def _handle_event_callback(
         )
         return
     if action == "edit_zoom":
+        if not editable:
+            await _show_event_menu(update, context, event_id, status_message=view_only_message)
+            return
         _clear_await(context)
         context.user_data["await"] = {"type": "ev_edit_zoom", "event_id": event_id}
         await _show_event_menu(update, context, event_id, status_message="Отправьте новую ссылку на Zoom или пустое сообщение.")
         return
     if action == "edit_pay":
+        if not editable:
+            await _show_event_menu(update, context, event_id, status_message=view_only_message)
+            return
         _clear_await(context)
         context.user_data["await"] = {"type": "ev_edit_pay", "event_id": event_id}
         await _show_event_menu(update, context, event_id, status_message="Отправьте ссылку на оплату или пустое сообщение.")
@@ -754,10 +839,16 @@ async def _handle_event_callback(
         await _show_event_menu(update, context, event_id, status_message=f"Ссылка на участников: {link}")
         return
     if action == "cancel":
+        if not editable:
+            await _show_event_menu(update, context, event_id, status_message=view_only_message)
+            return
         _push_entry(context, "event_cancel", event_id=event_id)
         await _show_cancel_confirmation(update, context, event_id)
         return
     if action == "cancel_yes":
+        if not editable:
+            await _show_event_menu(update, context, event_id, status_message=view_only_message)
+            return
         update_event(event_id, {"status": "cancelled"})
         if get_current_event_id() == event_id:
             set_current_event(None)
@@ -766,6 +857,77 @@ async def _handle_event_callback(
     if action == "cancel_no":
         _pop_entry(context)
         await _show_event_menu(update, context, event_id)
+        return
+
+
+async def _handle_wizard_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    step: str,
+    text: str,
+) -> None:
+    if not await _ensure_no_active_event(update, context):
+        return
+    draft = _draft(context)
+    if step == WIZARD_STEP_TITLE:
+        if not text:
+            await update.message.reply_text("Название не может быть пустым. Попробуй снова.")
+            return
+        draft["title"] = text
+        await update.message.reply_text(f"✅ Название задано: {text}")
+        _set_wizard_step(context, WIZARD_STEP_DATETIME)
+        context.user_data["await"] = {"type": "wizard", "step": WIZARD_STEP_DATETIME}
+        await _show_new_event(update, context)
+        await _prompt_wizard_step(update, context)
+        return
+    if step == WIZARD_STEP_DATETIME:
+        tz = draft.get("timezone") or TIMEZONE
+        try:
+            dt = _parse_datetime(text, tz)
+        except ValueError:
+            await update.message.reply_text(
+                "Не удалось распознать дату. Попробуй снова в формате ДД.ММ.ГГГГ ЧЧ:ММ."
+            )
+            return
+        now_local = datetime.now(ZoneInfo(tz))
+        if dt <= now_local:
+            await update.message.reply_text("⚠️ Эта дата уже прошла. Укажи будущую.")
+            return
+        draft["datetime"] = dt
+        formatted = dt.astimezone(ZoneInfo(tz)).strftime("%d.%m.%Y %H:%M")
+        await update.message.reply_text(f"✅ Дата и время установлены: {formatted}")
+        _set_wizard_step(context, WIZARD_STEP_ZOOM)
+        context.user_data["await"] = {"type": "wizard", "step": WIZARD_STEP_ZOOM}
+        await _show_new_event(update, context)
+        await _prompt_wizard_step(update, context)
+        return
+    if step == WIZARD_STEP_ZOOM:
+        if text:
+            draft["zoom_url"] = text
+            await update.message.reply_text(
+                f"✅ Zoom установлен: {text}", disable_web_page_preview=True
+            )
+        else:
+            draft["zoom_url"] = ""
+            await update.message.reply_text("⏭ Zoom пропущен.")
+        _set_wizard_step(context, WIZARD_STEP_PAY)
+        context.user_data["await"] = {"type": "wizard", "step": WIZARD_STEP_PAY}
+        await _show_new_event(update, context)
+        await _prompt_wizard_step(update, context)
+        return
+    if step == WIZARD_STEP_PAY:
+        if text:
+            draft["pay_url"] = text
+            await update.message.reply_text(
+                f"✅ Оплата установлена: {text}", disable_web_page_preview=True
+            )
+        else:
+            draft["pay_url"] = ""
+            await update.message.reply_text("⏭ Оплата пропущена.")
+        _set_wizard_step(context, WIZARD_STEP_READY)
+        _clear_await(context)
+        await _show_new_event(update, context)
+        await _prompt_wizard_step(update, context)
         return
 
 
@@ -779,22 +941,34 @@ async def _handle_menu_callback(
     await _close_wizard_panel(update, context)
     try:
         if data == "admin:menu:new":
+            if not await _ensure_no_active_event(update, context):
+                return
             _clear_draft(context)
             _clear_await(context)
             _push_entry(context, "new")
-            await _show_new_event(
-                update,
-                context,
-                status_message="Заполните карточку мероприятия шаг за шагом.",
-            )
+            _set_wizard_step(context, WIZARD_STEP_TITLE)
+            context.user_data["await"] = {"type": "wizard", "step": WIZARD_STEP_TITLE}
+            await _show_new_event(update, context)
+            await _prompt_wizard_step(update, context)
             return
         if data == "admin:menu:list":
             _clear_await(context)
             _push_entry(context, "list", page=1)
             await _show_event_list(update, context, page=1)
             return
+        if data == "admin:menu:manage":
+            active = get_active_event()
+            if not active:
+                await _show_main_menu(
+                    update, context, status_message="Нет активного мероприятия."
+                )
+                return
+            _push_entry(context, "event", event_id=active.event_id)
+            await _show_event_menu(update, context, active.event_id)
+            return
         if data == "admin:menu:participants":
-            current = get_current_event_id()
+            event = get_active_event() or get_current_event()
+            current = event.event_id if event else None
             if not current:
                 await _show_main_menu(
                     update, context, status_message="Нет активного мероприятия."
@@ -911,10 +1085,6 @@ async def _handle_nav_back(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await _close_wizard_panel(update, context)
         await _show_main_menu(update, context)
         return
-    if screen in {"new_tz", "new_confirm"}:
-        _pop_entry(context)
-        await _show_new_event(update, context)
-        return
     if screen == "broadcast":
         _pop_entry(context)
         await _show_main_menu(update, context)
@@ -996,6 +1166,10 @@ async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     text = (update.message.text or "").strip()
     state_type = await_state.get("type")
+    if state_type == "wizard":
+        step = str(await_state.get("step") or WIZARD_STEP_TITLE)
+        await _handle_wizard_message(update, context, step, text)
+        return
     if state_type == "broadcast":
         if not text:
             await update.message.reply_text("Сообщение не может быть пустым. Попробуйте снова.")
@@ -1006,40 +1180,6 @@ async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYP
         _clear_await(context)
         _pop_entry(context)
         await _show_main_menu(update, context, status_message="Рассылка отправлена.")
-        return
-    if state_type == "new_title":
-        if not text:
-            await update.message.reply_text("Название не может быть пустым. Попробуйте снова.")
-            return
-        _draft(context)["title"] = text
-        _clear_await(context)
-        await _show_new_event(update, context, status_message="Название сохранено.")
-        return
-    if state_type == "new_desc":
-        _draft(context)["description"] = text
-        _clear_await(context)
-        await _show_new_event(update, context, status_message="Описание обновлено.")
-        return
-    if state_type == "new_dt":
-        tz = await_state.get("timezone", TIMEZONE)
-        try:
-            dt = _parse_datetime(text, tz)
-        except ValueError:
-            await update.message.reply_text("Не удалось распознать дату. Попробуйте снова.")
-            return
-        _draft(context)["datetime"] = dt
-        _clear_await(context)
-        await _show_new_event(update, context, status_message="Дата и время сохранены.")
-        return
-    if state_type == "new_zoom":
-        _draft(context)["zoom_url"] = text
-        _clear_await(context)
-        await _show_new_event(update, context, status_message="Ссылка Zoom сохранена.")
-        return
-    if state_type == "new_pay":
-        _draft(context)["pay_url"] = text
-        _clear_await(context)
-        await _show_new_event(update, context, status_message="Ссылка на оплату сохранена.")
         return
     event_id = await_state.get("event_id")
     if not event_id:

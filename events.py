@@ -400,7 +400,7 @@ def _auto_update_status(events: List[Event], current_event_id: Optional[str]) ->
         if local_dt is None:
             continue
         now_local = datetime.now(local_dt.tzinfo)
-        status = "past" if local_dt.date() < now_local.date() else "active"
+        status = "past" if local_dt <= now_local else "active"
         if event.status != status:
             event.status = status
             event.updated_at = datetime.now(TZ).isoformat()
@@ -416,7 +416,40 @@ def classify_status(event: Event) -> str:
     if local_dt is None:
         return event.status or "active"
     now_local = datetime.now(local_dt.tzinfo)
-    return "past" if local_dt.date() < now_local.date() else "active"
+    return "past" if local_dt <= now_local else "active"
+
+
+def has_active_event() -> bool:
+    events, current_id = load_events()
+    _auto_update_status(events, current_id)
+    for event in events:
+        if classify_status(event) == "active":
+            return True
+    return False
+
+
+def get_active_event() -> Optional[Event]:
+    events, current_id = load_events()
+    _auto_update_status(events, current_id)
+    preferred: Optional[Event] = None
+    if current_id:
+        preferred = next((event for event in events if event.event_id == current_id), None)
+        if preferred and classify_status(preferred) == "active":
+            return preferred
+    active_events = [event for event in events if classify_status(event) == "active"]
+    if not active_events:
+        return None
+    def sort_key(event: Event) -> datetime:
+        dt = event.parsed_datetime
+        if dt is None:
+            return datetime.max.replace(tzinfo=TZ)
+        try:
+            return dt.astimezone(TZ)
+        except Exception:
+            return datetime.max.replace(tzinfo=TZ)
+
+    active_events.sort(key=sort_key)
+    return active_events[0]
 
 
 def events_refresh_if_stale(
@@ -589,9 +622,16 @@ def create_event(
     pay_url: str,
 ) -> Event:
     events, current_id = load_events()
+    now_iso = datetime.now(TZ).isoformat()
+    _auto_update_status(events, current_id)
+    for existing in events:
+        if existing.status == "cancelled":
+            continue
+        if existing.status != "past":
+            existing.status = "past"
+            existing.updated_at = now_iso
     event_id = _generate_event_id(title, event_dt)
     sheet_name, sheet_link = create_event_sheet(event_id)
-    now_iso = datetime.now(TZ).isoformat()
     try:
         tz = ZoneInfo(timezone)
     except Exception:
