@@ -1,0 +1,710 @@
+diff --git a/admin_panel.py b/admin_panel.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..0a7501fa2bf5e82287aa2ec742f194dff09c0a42
+--- /dev/null
++++ b/admin_panel.py
+@@ -0,0 +1,214 @@
++"""Administrative tools for configuring the webinar bot."""
++from __future__ import annotations
++
++from datetime import datetime
++from pathlib import Path
++
++from telegram import ReplyKeyboardMarkup, ReplyKeyboardRemove, Update
++from telegram.constants import ParseMode
++from telegram.ext import (
++    CommandHandler,
++    ContextTypes,
++    ConversationHandler,
++    MessageHandler,
++    filters,
++)
++
++import database
++from config import ADMIN_CHAT_ID, load_settings, update_settings
++from scheduler import ensure_scheduler_started, schedule_all_reminders
++
++MENU_KEYBOARD = ReplyKeyboardMarkup(
++    [
++        ["📆 Изменить дату", "📝 Изменить тему"],
++        ["🔗 Обновить Zoom", "💳 Обновить оплату"],
++        ["📥 Список участников", "📢 Разослать напоминание"],
++    ],
++    resize_keyboard=True,
++)
++
++STATE_TOPIC, STATE_DATE, STATE_ZOOM, STATE_PAYMENT, STATE_NOTIFY = range(5)
++
++
++def _is_admin(update: Update) -> bool:
++    user = update.effective_user
++    return bool(user and user.id == ADMIN_CHAT_ID)
++
++
++async def send_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
++    settings = load_settings()
++    text = (
++        "<b>Панель администратора</b>\n\n"
++        f"Тема: {settings.get('topic')}\n"
++        f"Описание: {settings.get('description')}\n"
++        f"Дата: {settings.get('event_datetime') or 'не задана'}\n"
++        f"Zoom: {settings.get('zoom_link') or 'не задан'}\n"
++        f"Оплата: {settings.get('payment_link') or 'не задана'}"
++    )
++    if update.message:
++        await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=MENU_KEYBOARD)
++    else:
++        await update.effective_chat.send_message(text, parse_mode=ParseMode.HTML, reply_markup=MENU_KEYBOARD)
++
++
++async def admin_command_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
++    if not _is_admin(update):
++        await update.message.reply_text("Эта команда доступна только администратору.")
++        return ConversationHandler.END
++    await send_admin_panel(update, context)
++    return ConversationHandler.END
++
++
++async def set_topic_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
++    if not _is_admin(update):
++        return ConversationHandler.END
++    await update.message.reply_text(
++        "Введите новую тему и описание через символ \"|\".\n"
++        "Например: Мой вебинар | Погружение в психологию",
++        reply_markup=ReplyKeyboardRemove(),
++    )
++    return STATE_TOPIC
++
++
++async def set_topic_finish(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
++    if not _is_admin(update):
++        return ConversationHandler.END
++    payload = (update.message.text or "").split("|", maxsplit=1)
++    topic = payload[0].strip() if payload else ""
++    description = payload[1].strip() if len(payload) > 1 else ""
++    update_settings(topic=topic or None, description=description or None)
++    await update.message.reply_text("Тема и описание обновлены.", reply_markup=MENU_KEYBOARD)
++    return ConversationHandler.END
++
++
++def _parse_datetime(text: str) -> datetime:
++    text = text.strip()
++    formats = ["%d.%m.%Y %H:%M", "%d.%m %H:%M"]
++    for fmt in formats:
++        try:
++            dt = datetime.strptime(text, fmt)
++            if fmt == "%d.%m %H:%M":
++                dt = dt.replace(year=datetime.now().year)
++            return dt
++        except ValueError:
++            continue
++    raise ValueError("invalid format")
++
++
++async def set_date_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
++    if not _is_admin(update):
++        return ConversationHandler.END
++    await update.message.reply_text(
++        "Введите дату и время в формате ДД.ММ.ГГГГ ЧЧ:ММ или ДД.ММ ЧЧ:ММ",
++        reply_markup=ReplyKeyboardRemove(),
++    )
++    return STATE_DATE
++
++
++async def set_date_finish(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
++    if not _is_admin(update):
++        return ConversationHandler.END
++    text = update.message.text or ""
++    try:
++        event_dt = _parse_datetime(text)
++    except ValueError:
++        await update.message.reply_text("Не удалось распознать дату. Попробуйте снова.")
++        return STATE_DATE
++
++    update_settings(event_datetime=event_dt.isoformat())
++    await update.message.reply_text("Дата вебинара обновлена.", reply_markup=MENU_KEYBOARD)
++    ensure_scheduler_started()
++    schedule_all_reminders(context.application)
++    return ConversationHandler.END
++
++
++async def set_zoom_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
++    if not _is_admin(update):
++        return ConversationHandler.END
++    await update.message.reply_text("Отправьте новую Zoom-ссылку:", reply_markup=ReplyKeyboardRemove())
++    return STATE_ZOOM
++
++
++async def set_zoom_finish(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
++    if not _is_admin(update):
++        return ConversationHandler.END
++    link = (update.message.text or "").strip()
++    update_settings(zoom_link=link)
++    await update.message.reply_text("Ссылка Zoom обновлена.", reply_markup=MENU_KEYBOARD)
++    schedule_all_reminders(context.application)
++    return ConversationHandler.END
++
++
++async def set_payment_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
++    if not _is_admin(update):
++        return ConversationHandler.END
++    await update.message.reply_text("Отправьте ссылку на оплату (Robokassa):", reply_markup=ReplyKeyboardRemove())
++    return STATE_PAYMENT
++
++
++async def set_payment_finish(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
++    if not _is_admin(update):
++        return ConversationHandler.END
++    link = (update.message.text or "").strip()
++    update_settings(payment_link=link)
++    await update.message.reply_text("Ссылка на оплату обновлена.", reply_markup=MENU_KEYBOARD)
++    return ConversationHandler.END
++
++
++async def export_participants(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
++    if not _is_admin(update):
++        await update.message.reply_text("Недостаточно прав.")
++        return ConversationHandler.END
++    path = database.export_database()
++    await update.message.reply_document(document=path.read_bytes(), filename=Path(path).name)
++    return ConversationHandler.END
++
++
++async def notify_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
++    if not _is_admin(update):
++        return ConversationHandler.END
++    await update.message.reply_text(
++        "Введите текст напоминания, который будет отправлен всем участникам:",
++        reply_markup=ReplyKeyboardRemove(),
++    )
++    return STATE_NOTIFY
++
++
++async def notify_finish(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
++    if not _is_admin(update):
++        return ConversationHandler.END
++    text = update.message.text or ""
++    participants = database.list_chat_ids()
++    for chat_id in participants:
++        await context.bot.send_message(chat_id=chat_id, text=text)
++    await update.message.reply_text("Рассылка отправлена.", reply_markup=MENU_KEYBOARD)
++    return ConversationHandler.END
++
++
++def build_admin_conversation() -> ConversationHandler:
++    return ConversationHandler(
++        entry_points=[
++            CommandHandler("admin", admin_command_entry),
++            CommandHandler("set_topic", set_topic_start),
++            CommandHandler("set_date", set_date_start),
++            CommandHandler("set_zoom", set_zoom_start),
++            CommandHandler("set_payment", set_payment_start),
++            CommandHandler("export", export_participants),
++            CommandHandler("notify", notify_start),
++            MessageHandler(filters.Regex("^📝"), set_topic_start),
++            MessageHandler(filters.Regex("^📆"), set_date_start),
++            MessageHandler(filters.Regex("^🔗"), set_zoom_start),
++            MessageHandler(filters.Regex("^💳"), set_payment_start),
++            MessageHandler(filters.Regex("^📥"), export_participants),
++            MessageHandler(filters.Regex("^📢"), notify_start),
++        ],
++        states={
++            STATE_TOPIC: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_topic_finish)],
++            STATE_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_date_finish)],
++            STATE_ZOOM: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_zoom_finish)],
++            STATE_PAYMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_payment_finish)],
++            STATE_NOTIFY: [MessageHandler(filters.TEXT & ~filters.COMMAND, notify_finish)],
++        },
++        fallbacks=[CommandHandler("cancel", admin_command_entry)],
++        allow_reentry=True,
++    )
+diff --git a/config.py b/config.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..87c499c9a2193c9cdc9f077061a3bbec099b9394
+--- /dev/null
++++ b/config.py
+@@ -0,0 +1,58 @@
++"""Configuration utilities for the psychology webinar bot."""
++from __future__ import annotations
++
++import json
++from pathlib import Path
++from typing import Any, Dict
++
++# Bot credentials and application level constants
++BOT_TOKEN: str = "8334419696:AAFrH3-0nUn518KogBviZ-Qquvl6QtHwyDU"
++# Replace with the administrator chat ID that should have access to privileged commands.
++ADMIN_CHAT_ID: int = 123456789
++
++# Storage locations
++DATA_DIR = Path("data")
++SETTINGS_FILE = DATA_DIR / "config.json"
++
++_DEFAULT_SETTINGS: Dict[str, Any] = {
++    "topic": "Психологический вебинар",
++    "description": "Авторский вебинар по психологии",
++    "event_datetime": None,  # ISO formatted date time string
++    "zoom_link": "",
++    "payment_link": "",
++}
++
++
++def ensure_data_dir() -> None:
++    """Ensure that all required folders exist."""
++    DATA_DIR.mkdir(parents=True, exist_ok=True)
++
++
++def load_settings() -> Dict[str, Any]:
++    """Load the admin editable settings from disk."""
++    ensure_data_dir()
++    if not SETTINGS_FILE.exists():
++        save_settings(_DEFAULT_SETTINGS)
++        return dict(_DEFAULT_SETTINGS)
++
++    with SETTINGS_FILE.open("r", encoding="utf-8") as fh:
++        data = json.load(fh)
++
++    merged = dict(_DEFAULT_SETTINGS)
++    merged.update({k: v for k, v in data.items() if v is not None})
++    return merged
++
++
++def save_settings(settings: Dict[str, Any]) -> None:
++    """Persist settings to disk."""
++    ensure_data_dir()
++    with SETTINGS_FILE.open("w", encoding="utf-8") as fh:
++        json.dump(settings, fh, ensure_ascii=False, indent=2)
++
++
++def update_settings(**kwargs: Any) -> Dict[str, Any]:
++    """Update settings atomically with provided key-value pairs."""
++    current = load_settings()
++    current.update({k: v for k, v in kwargs.items() if v is not None})
++    save_settings(current)
++    return current
+diff --git a/data/config.json b/data/config.json
+new file mode 100644
+index 0000000000000000000000000000000000000000..69c40b4b4b6cec7391945ebfa306e3b518457299
+--- /dev/null
++++ b/data/config.json
+@@ -0,0 +1,7 @@
++{
++  "topic": "Психологический вебинар",
++  "description": "Авторский вебинар по психологии",
++  "event_datetime": null,
++  "zoom_link": "",
++  "payment_link": ""
++}
+\ No newline at end of file
+diff --git a/data/participants.xlsx b/data/participants.xlsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..7d2a14c5fec13f0fdcc7044fd926362107e05406
+GIT binary patch
+literal 1641
+zcmWIWW@Zs#U|`^2sNnI9u3szS@*BuAVq#zr2GY^a`FSO&c_r~7l?AEAv3eD`Icq1K
+z^*d}J(DJ^P>-2T4vQvzTQ<kvT^&MDfbKp^qkoLdHZ>N3umJ{T_5qM<bzBOxR-po(g
+zdCTwG2IgZ+_OAZvHf7Gj;C)xut^fJ?-M$@<Zl{I5y~m{H7B@Z1?upF0r9N2>+@3!g
+z`lg(7=bpK4<8;O=9JZ&rH|?2nYIl#Gc;&r=vqcvN-%Vn#o_zDJ%Pm2<iz?^x`rb)K
+z6muNRV4Yb~S@4!W<YS}Ylo*@L3yNz`9(bC0MrZ!A8h-mryIt-oRX5F$KQJlO&u!l?
+zi+vULUHi@dUb<dBH|$2$*6kvKnl3G7yd5{CHu@ww?*3};t<$M8eWPXZ?Dc==r)ur|
+z)A&p_041#AULM-L3K&MRj0_CiKsvrCHK$l#4@CC%ALMH?5O8^4<GQ(Av%=t5#10AJ
+zb!_$vrY#l7*q*ui(f!+tCHT+f8gI@wI$mXHT)lu_Ig&9oj=_2L3hA|C1-a*E+g=GR
+z+w(vtxvM3yq;aXdGz*X6F6QTsycsDcPA>HI^S^guhTr;~ld~pC{oJNecBkHG!KsK#
+zTxVwaHRSISiuhgh!=Lf%-xVKRUgcdlCT|<x=`t-YS!BbRKc02F1br);nEbVWW~F^)
+zL-i7)!9{^RK(D9*y~GcsD{}P9^NX^R^7FGnQ4jQ1-XQ~?w)Zx!Ppo}!GWv!_>tzU)
+zS2Rr6WwL0avh@aAJHgnkuWLTNzyIsae%n7sZrTKz7?f^Uon_!LuiargpWgHJZ`Eaf
+z`TjmzwBP8yZ>0L$gj1HL*H+Cpuv%-OD4L$qsVA;!zS{Ewua)96i`)IX?%jUDbkHf|
+zi9L_p@dqDI{1cq`iAiuytls%oB9ol<8!o-|T{8B_{R0!aZ#WiBYUV!~7-o?F++@m{
+zge9CyCtlvb{M&nz_NuMf&;GHZdQ_2pzVtev2jzesm4bK_5`D<tg+`?<*I@&m*6(u;
+zW#msO(O7!qWDr-RcNN29jg6j3(zpNauJvud<j|faST$+i@zt}A8*P^UxnS+XfM=`*
+zMwh<b>XFgAo4L7t*|}B5XO)&sUa*B*=kJUIjz?ecbvSB8xtv(5JlU-IYj;QH7iB9&
+zbwi=N?xgmAvl&Z|1+6`>=B?$AZTgL+{_g)JZX{lq)E5>fZuGI8|K8g9O-fyyT7Nty
+z9(L#Yk(WAeMT4f=x}t0PsJ`5HooOi-(1*If+$@2J&f<*J)RJO-Fl7je*V>C4L0OvN
+z!ru7A%H`9I6k24$FKp?M{KXjd%1msd>`k#$mp2_#J3IL`gqWMS>K=Y_w^-<;pjz?i
+z?$48U^3w6IC&hR^pK7Wp%PZ`)<m6kYnW0|K#W(MDwtB|AZQHv`;z4Xe=cVUgQfhg{
+zao~CDl|%fws=jM<)?QXRa$)U(aKA3s?h?-5o<$5%8qPl(jvT$^q}KGK@AjO{*^eG+
+zYou3hwv-DL3R>l}vd4yB@7dJnIt4Wca%;~k6tMZSeVS|WQn*-uu3%Kz4A1#9MU>{G
+z$|}7UzI-F`CgZZby*3ZsYn!9*T-h$0ckQ*@N8$U@t+V;cf1R&g|D);rSJ{1kO9kxf
+z&82>rO0(H7ejXp-&B!FejJrGp1|k?V07DgP>4<IsdLaSP&cM*Xr~@<tsmMUrh@KS@
+z8vg?|qGe2U&FIM+q4@<cDF8L&NbKn5peG=NIp>(+j=)Gx0p6@^AeF2@=n8Z!A1jCl
+E0Q-x6<NyEw
+
+literal 0
+HcmV?d00001
+
+diff --git a/database.py b/database.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..f8d3b37f2bcb569794b0bbfd13d23616dcc5a219
+--- /dev/null
++++ b/database.py
+@@ -0,0 +1,120 @@
++"""Simple Excel backed storage for webinar participants."""
++from __future__ import annotations
++
++from dataclasses import dataclass
++from pathlib import Path
++from typing import List, Optional
++
++import pandas as pd
++
++from config import DATA_DIR
++
++DATABASE_PATH = DATA_DIR / "participants.xlsx"
++COLUMNS = [
++    "Имя",
++    "Username",
++    "ChatID",
++    "Email",
++    "Формат",
++    "Оплата",
++    "Фидбэк",
++]
++
++
++@dataclass
++class Participant:
++    name: str
++    username: str
++    chat_id: int
++    email: str
++    participation_type: str = "free"
++    payment_status: str = "нет"
++    feedback: str = ""
++
++
++def _load_dataframe() -> pd.DataFrame:
++    if not DATABASE_PATH.exists():
++        ensure_database()
++    return pd.read_excel(DATABASE_PATH)
++
++
++def ensure_database() -> None:
++    """Create an empty database file if missing."""
++    DATA_DIR.mkdir(parents=True, exist_ok=True)
++    if DATABASE_PATH.exists():
++        return
++    empty = pd.DataFrame(columns=COLUMNS)
++    empty.to_excel(DATABASE_PATH, index=False)
++
++
++def add_or_update_participant(participant: Participant) -> None:
++    df = _load_dataframe()
++    mask = df["ChatID"] == participant.chat_id
++    if mask.any():
++        df.loc[mask, ["Имя", "Username", "Email"]] = [
++            participant.name,
++            participant.username,
++            participant.email,
++        ]
++    else:
++        df = pd.concat(
++            [
++                df,
++                pd.DataFrame(
++                    [
++                        [
++                            participant.name,
++                            participant.username,
++                            participant.chat_id,
++                            participant.email,
++                            participant.participation_type,
++                            participant.payment_status,
++                            participant.feedback,
++                        ]
++                    ],
++                    columns=COLUMNS,
++                ),
++            ],
++            ignore_index=True,
++        )
++    df.to_excel(DATABASE_PATH, index=False)
++
++
++def update_participation(chat_id: int, participation_type: str, payment_status: str) -> None:
++    df = _load_dataframe()
++    mask = df["ChatID"] == chat_id
++    if not mask.any():
++        return
++    df.loc[mask, ["Формат", "Оплата"]] = [participation_type, payment_status]
++    df.to_excel(DATABASE_PATH, index=False)
++
++
++def update_feedback(chat_id: int, feedback: str) -> None:
++    df = _load_dataframe()
++    mask = df["ChatID"] == chat_id
++    if not mask.any():
++        return
++    df.loc[mask, "Фидбэк"] = feedback
++    df.to_excel(DATABASE_PATH, index=False)
++
++
++def get_participants() -> pd.DataFrame:
++    return _load_dataframe()
++
++
++def list_chat_ids() -> List[int]:
++    df = _load_dataframe()
++    return [int(cid) for cid in df["ChatID"].dropna().tolist()]
++
++
++def export_database(destination: Optional[Path] = None) -> Path:
++    """Create a copy of the database and return the file path."""
++    ensure_database()
++    if destination is None:
++        destination = DATABASE_PATH
++    else:
++        destination.parent.mkdir(parents=True, exist_ok=True)
++        df = _load_dataframe()
++        df.to_excel(destination, index=False)
++        return destination
++    return destination
+diff --git a/handlers.py b/handlers.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..6a4f31dcfca4e87441f74a97b8202ef5b0f9da6c
+--- /dev/null
++++ b/handlers.py
+@@ -0,0 +1,122 @@
++"""User interaction handlers for the psychology webinar bot."""
++from __future__ import annotations
++
++import re
++
++from telegram import ReplyKeyboardMarkup, ReplyKeyboardRemove, Update
++from telegram.ext import (
++    CommandHandler,
++    ContextTypes,
++    ConversationHandler,
++    MessageHandler,
++    filters,
++)
++
++import database
++from config import ADMIN_CHAT_ID, load_settings
++
++WAITING_EMAIL, WAITING_FORMAT = range(2)
++FREE_BUTTON = "🆓 Наблюдатель (бесплатно)"
++PAID_BUTTON = "💰 Участник с разбором (платно)"
++
++EMAIL_REGEX = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
++
++
++async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
++    user = update.effective_user
++    if user and user.id == ADMIN_CHAT_ID:
++        from admin_panel import send_admin_panel
++
++        await send_admin_panel(update, context)
++        return ConversationHandler.END
++
++    await update.message.reply_text(
++        "Добро пожаловать на вебинар по психологии!\n"
++        "Пожалуйста, укажите ваш e-mail для регистрации.",
++        reply_markup=ReplyKeyboardRemove(),
++    )
++    return WAITING_EMAIL
++
++
++async def handle_email(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
++    email = (update.message.text or "").strip()
++    if not EMAIL_REGEX.match(email):
++        await update.message.reply_text("Похоже, это не e-mail. Попробуйте снова.")
++        return WAITING_EMAIL
++
++    user = update.effective_user
++    participant = database.Participant(
++        name=user.full_name,
++        username=f"@{user.username}" if user.username else "",
++        chat_id=update.effective_chat.id,
++        email=email,
++    )
++    database.add_or_update_participant(participant)
++
++    await update.message.reply_text(
++        "Вы зарегистрированы на вебинар 💫 Ссылка придёт в день проведения.",
++    )
++
++    keyboard = ReplyKeyboardMarkup([[FREE_BUTTON], [PAID_BUTTON]], resize_keyboard=True)
++    await update.message.reply_text("Выберите формат участия:", reply_markup=keyboard)
++    return WAITING_FORMAT
++
++
++async def handle_format(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
++    choice = (update.message.text or "").strip()
++    settings = load_settings()
++    payment_link = settings.get("payment_link", "")
++
++    if choice == FREE_BUTTON:
++        database.update_participation(update.effective_chat.id, "free", "нет")
++        await update.message.reply_text(
++            "Вы выбрали формат наблюдателя. Ждите ссылку в день вебинара!",
++            reply_markup=ReplyKeyboardRemove(),
++        )
++        return ConversationHandler.END
++
++    if choice == PAID_BUTTON:
++        database.update_participation(update.effective_chat.id, "paid", "ожидает оплаты")
++        if payment_link:
++            message = f"Для оплаты используйте ссылку: {payment_link}"
++        else:
++            message = "Ссылка для оплаты пока не задана. Свяжитесь с организатором."
++        await update.message.reply_text(message, reply_markup=ReplyKeyboardRemove())
++        return ConversationHandler.END
++
++    await update.message.reply_text(
++        "Пожалуйста, используйте кнопки для выбора формата участия."
++    )
++    return WAITING_FORMAT
++
++
++async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
++    await update.message.reply_text(
++        "Регистрация отменена.", reply_markup=ReplyKeyboardRemove()
++    )
++    return ConversationHandler.END
++
++
++async def feedback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
++    chat_id = update.effective_chat.id
++    awaiting = context.application.bot_data.setdefault("awaiting_feedback", set())
++    if chat_id not in awaiting:
++        return
++    feedback = (update.message.text or "").strip()
++    if not feedback:
++        return
++    database.update_feedback(chat_id, feedback)
++    awaiting.discard(chat_id)
++    await update.message.reply_text("Спасибо за обратную связь! 💖")
++
++
++def build_conversation_handler() -> ConversationHandler:
++    return ConversationHandler(
++        entry_points=[CommandHandler("start", start)],
++        states={
++            WAITING_EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_email)],
++            WAITING_FORMAT: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_format)],
++        },
++        fallbacks=[CommandHandler("cancel", cancel)],
++        allow_reentry=True,
++    )
+diff --git a/main.py b/main.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..2df2ff35363658fc1948be94b4f8460f2f415b76
+--- /dev/null
++++ b/main.py
+@@ -0,0 +1,32 @@
++"""Entry point for the psychology webinar Telegram bot."""
++from __future__ import annotations
++
++from telegram.ext import Application, MessageHandler, filters
++
++import config
++import database
++from admin_panel import build_admin_conversation
++from handlers import build_conversation_handler, feedback_handler
++from scheduler import ensure_scheduler_started, schedule_all_reminders
++
++
++async def _post_init(application: Application) -> None:
++    config.ensure_data_dir()
++    database.ensure_database()
++    ensure_scheduler_started()
++    schedule_all_reminders(application)
++
++
++def main() -> None:
++    application = Application.builder().token(config.BOT_TOKEN).build()
++    application.post_init = _post_init
++
++    application.add_handler(build_conversation_handler())
++    application.add_handler(build_admin_conversation())
++    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, feedback_handler))
++
++    application.run_polling()
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/requirements.txt b/requirements.txt
+new file mode 100644
+index 0000000000000000000000000000000000000000..7c0ab9b670cd6f641f4afae5946b6577c1f9aaef
+--- /dev/null
++++ b/requirements.txt
+@@ -0,0 +1,4 @@
++python-telegram-bot==20.7
++apscheduler==3.10.4
++pandas==2.2.2
++openpyxl==3.1.2
+diff --git a/scheduler.py b/scheduler.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..b3f944967b0af87da19b16f1916edd8d5ee8e7ca
+--- /dev/null
++++ b/scheduler.py
+@@ -0,0 +1,67 @@
++"""Apscheduler integration for webinar reminders."""
++from __future__ import annotations
++
++from datetime import datetime, timedelta
++
++from apscheduler.schedulers.asyncio import AsyncIOScheduler
++from apscheduler.triggers.date import DateTrigger
++
++import database
++from config import load_settings
++
++scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
++
++
++async def _send_bulk_message(application, text: str) -> None:
++    participants = database.get_participants()
++    for _, row in participants.iterrows():
++        chat_id = int(row["ChatID"])
++        if not chat_id:
++            continue
++        await application.bot.send_message(chat_id=chat_id, text=text)
++
++
++async def _send_feedback_request(application, text: str) -> None:
++    participants = database.get_participants()
++    waiting_feedback = application.bot_data.setdefault("awaiting_feedback", set())
++    for _, row in participants.iterrows():
++        chat_id = int(row["ChatID"])
++        if not chat_id:
++            continue
++        waiting_feedback.add(chat_id)
++        await application.bot.send_message(chat_id=chat_id, text=text)
++
++
++def _schedule_job(run_time: datetime, coroutine, *args) -> None:
++    if run_time <= datetime.now(run_time.tzinfo):
++        return
++    scheduler.add_job(coroutine, trigger=DateTrigger(run_date=run_time), args=args, misfire_grace_time=300)
++
++
++def schedule_all_reminders(application) -> None:
++    settings = load_settings()
++    event_iso = settings.get("event_datetime")
++    if not event_iso:
++        return
++
++    event_dt = datetime.fromisoformat(event_iso)
++    scheduler.remove_all_jobs()
++
++    zoom_link = settings.get("zoom_link", "")
++
++    day_before = event_dt - timedelta(days=1)
++    hour_before = event_dt - timedelta(hours=1)
++    day_after = event_dt + timedelta(days=1)
++
++    text_day_before = "Напоминаем, вебинар уже завтра! 💫\n" + (f"Ваша ссылка: {zoom_link}" if zoom_link else "")
++    text_hour_before = "Скоро начинаем! Вот ваша ссылка: {link}".format(link=zoom_link or "Ссылка появится позже")
++    text_day_after = "Спасибо, что были с нами 💕 Поделитесь впечатлениями?"
++
++    _schedule_job(day_before, _send_bulk_message, application, text_day_before)
++    _schedule_job(hour_before, _send_bulk_message, application, text_hour_before)
++    _schedule_job(day_after, _send_feedback_request, application, text_day_after)
++
++
++def ensure_scheduler_started() -> None:
++    if not scheduler.running:
++        scheduler.start()
+
