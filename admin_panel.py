@@ -23,28 +23,77 @@ import database
 from config import TIMEZONE, is_admin, load_settings, update_settings
 from scheduler import ensure_scheduler_started, schedule_all_reminders
 
-ADMIN_PANEL, WAITING_BROADCAST, WAITING_WELCOME, NEW_EVENT_TITLE, NEW_EVENT_DESCRIPTION, NEW_EVENT_DATETIME, NEW_EVENT_ZOOM, NEW_EVENT_PAYMENT = range(8)
+(
+    ADMIN_PANEL,
+    WAITING_EDIT_DESCRIPTION,
+    WAITING_EDIT_TITLE,
+    WAITING_EDIT_DATETIME,
+    WAITING_EDIT_ZOOM,
+    WAITING_EDIT_PAYMENT,
+    WAITING_BROADCAST,
+    NEW_EVENT_TITLE,
+    NEW_EVENT_DESCRIPTION,
+    NEW_EVENT_DATETIME,
+    NEW_EVENT_ZOOM,
+    NEW_EVENT_PAYMENT,
+) = range(12)
 
 CALLBACK_NEW_EVENT = "admin:new_event"
-CALLBACK_VIEW_REG = "admin:registrations"
-CALLBACK_BROADCAST = "admin:broadcast"
-CALLBACK_WELCOME = "admin:welcome"
-CALLBACK_OPEN_SHEET = "admin:sheet"
-CALLBACK_EXPORT_CSV = "admin:export"
-CALLBACK_REFRESH = "admin:refresh"
+CALLBACK_SHOW_EVENT = "admin:show_event"
+CALLBACK_EDIT_DESCRIPTION = "admin:edit_description"
+CALLBACK_EDIT_TITLE = "admin:edit_title"
+CALLBACK_EDIT_DATETIME = "admin:edit_datetime"
+CALLBACK_UPDATE_ZOOM = "admin:update_zoom"
+CALLBACK_UPDATE_PAYMENT = "admin:update_payment"
+CALLBACK_LIST_PARTICIPANTS = "admin:list_participants"
+CALLBACK_EXPORT_CSV = "admin:export_csv"
+CALLBACK_REMIND_ALL = "admin:remind_all"
 
 TZ = ZoneInfo(TIMEZONE)
 
 
 def _build_admin_keyboard() -> InlineKeyboardMarkup:
     keyboard = [
-        [InlineKeyboardButton("🆕 Создать мероприятие", callback_data=CALLBACK_NEW_EVENT)],
-        [InlineKeyboardButton("📋 Регистрации", callback_data=CALLBACK_VIEW_REG)],
-        [InlineKeyboardButton("📢 Напомнить всем", callback_data=CALLBACK_BROADCAST)],
-        [InlineKeyboardButton("👋 Приветствие", callback_data=CALLBACK_WELCOME)],
-        [InlineKeyboardButton("📊 Google Sheet", callback_data=CALLBACK_OPEN_SHEET)],
-        [InlineKeyboardButton("⬇️ Экспорт CSV", callback_data=CALLBACK_EXPORT_CSV)],
-        [InlineKeyboardButton("🔄 Обновить", callback_data=CALLBACK_REFRESH)],
+        [
+            InlineKeyboardButton(
+                "🆕 Создать мероприятие", callback_data=CALLBACK_NEW_EVENT
+            ),
+            InlineKeyboardButton(
+                "👁 Текущее мероприятие", callback_data=CALLBACK_SHOW_EVENT
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "📝 Изменить описание", callback_data=CALLBACK_EDIT_DESCRIPTION
+            ),
+            InlineKeyboardButton(
+                "✏️ Изменить название", callback_data=CALLBACK_EDIT_TITLE
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "📆 Изменить дату", callback_data=CALLBACK_EDIT_DATETIME
+            ),
+            InlineKeyboardButton(
+                "🔗 Обновить Zoom", callback_data=CALLBACK_UPDATE_ZOOM
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "💳 Обновить оплату", callback_data=CALLBACK_UPDATE_PAYMENT
+            ),
+            InlineKeyboardButton(
+                "📊 Список участников", callback_data=CALLBACK_LIST_PARTICIPANTS
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                "📥 Экспорт CSV", callback_data=CALLBACK_EXPORT_CSV
+            ),
+            InlineKeyboardButton(
+                "📣 Напомнить всем", callback_data=CALLBACK_REMIND_ALL
+            ),
+        ],
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -94,18 +143,17 @@ def _format_datetime(dt: Optional[datetime]) -> str:
 def _build_panel_text(settings: Dict[str, object], extra: Optional[str] = None) -> str:
     topic = html.escape(_format_value(settings.get("topic")))
     description = html.escape(_format_value(settings.get("description")))
-    welcome = html.escape(_format_value(settings.get("welcome_text")))
-    zoom_link = html.escape(settings.get("zoom_link") or "❗️Не указано")
-    payment_link = html.escape(settings.get("payment_link") or "❗️Не указано")
+    zoom_link = html.escape(_format_value(settings.get("zoom_link")))
+    payment_link = html.escape(_format_value(settings.get("payment_link")))
     dt_text = html.escape(_format_datetime(_event_datetime(settings)))
 
-    lines = ["<b>Панель администратора</b>"]
-    lines.append(f"👋 Приветствие: {welcome}")
+    lines = ["<b>Текущее мероприятие</b>"]
     lines.append(f"🎓 Название: {topic}")
     lines.append(f"📝 Описание: {description}")
     lines.append(f"📅 Дата и время: {dt_text}")
     lines.append(f"🔗 Zoom: {zoom_link}")
     lines.append(f"💳 Оплата: {payment_link}")
+    lines.append(f"🌍 Часовой пояс: {html.escape(TIMEZONE)}")
 
     sheet_name = settings.get("current_event_sheet_name")
     if sheet_name:
@@ -220,14 +268,116 @@ def _parse_datetime(text: str) -> datetime:
     raise ValueError("invalid datetime")
 
 
-async def _handle_view_reg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+def _event_is_configured(settings: Dict[str, object]) -> bool:
+    return bool(settings.get("current_event_id"))
+
+
+async def _ensure_active_event(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> Optional[Dict[str, object]]:
+    settings = load_settings()
+    if not _event_is_configured(settings):
+        await show_admin_panel(
+            update,
+            context,
+            status_message="Активное мероприятие не настроено. Создайте новое событие.",
+        )
+        return None
+    return settings
+
+
+async def _handle_show_event(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.callback_query:
+        await update.callback_query.answer()
+    await show_admin_panel(update, context)
+    return ADMIN_PANEL
+
+
+async def _handle_edit_description(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    if update.callback_query:
+        await update.callback_query.answer()
+    if await _ensure_active_event(update, context) is None:
+        return ADMIN_PANEL
+    await show_admin_panel(
+        update,
+        context,
+        status_message="Отправьте новый текст описания одним сообщением.",
+    )
+    return WAITING_EDIT_DESCRIPTION
+
+
+async def _handle_edit_title(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.callback_query:
+        await update.callback_query.answer()
+    if await _ensure_active_event(update, context) is None:
+        return ADMIN_PANEL
+    await show_admin_panel(
+        update,
+        context,
+        status_message="Введите новое название мероприятия.",
+    )
+    return WAITING_EDIT_TITLE
+
+
+async def _handle_edit_datetime(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    if update.callback_query:
+        await update.callback_query.answer()
+    if await _ensure_active_event(update, context) is None:
+        return ADMIN_PANEL
+    await show_admin_panel(
+        update,
+        context,
+        status_message="Укажите новую дату и время в формате ДД.ММ.ГГГГ ЧЧ:ММ или ДД.ММ ЧЧ:ММ.",
+    )
+    return WAITING_EDIT_DATETIME
+
+
+async def _handle_update_zoom(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if update.callback_query:
+        await update.callback_query.answer()
+    if await _ensure_active_event(update, context) is None:
+        return ADMIN_PANEL
+    await show_admin_panel(
+        update,
+        context,
+        status_message="Отправьте актуальную ссылку на Zoom (можно оставить пустой).",
+    )
+    return WAITING_EDIT_ZOOM
+
+
+async def _handle_update_payment(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    if update.callback_query:
+        await update.callback_query.answer()
+    if await _ensure_active_event(update, context) is None:
+        return ADMIN_PANEL
+    await show_admin_panel(
+        update,
+        context,
+        status_message="Отправьте ссылку на оплату (можно оставить пустой).",
+    )
+    return WAITING_EDIT_PAYMENT
+
+
+async def _handle_list_participants(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    if update.callback_query:
+        await update.callback_query.answer()
+    if await _ensure_active_event(update, context) is None:
+        return ADMIN_PANEL
     try:
         df = database.get_participants()
     except RuntimeError:
         await show_admin_panel(
             update,
             context,
-            status_message="Активное мероприятие не настроено. Создайте новое событие.",
+            status_message="Список участников недоступен. Проверьте настройки мероприятия.",
         )
         return ADMIN_PANEL
     total = len(df.index)
@@ -251,36 +401,6 @@ async def _handle_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         status_message="Введите текст напоминания, который получат все участники.",
     )
     return WAITING_BROADCAST
-
-
-async def _handle_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if update.callback_query:
-        await update.callback_query.answer()
-    await show_admin_panel(
-        update,
-        context,
-        status_message="Отправьте новый текст приветствия для участников.",
-    )
-    return WAITING_WELCOME
-
-
-async def _handle_open_sheet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    try:
-        link = database.get_sheet_link()
-    except RuntimeError:
-        await show_admin_panel(
-            update,
-            context,
-            status_message="Активный лист не настроен. Создайте мероприятие.",
-        )
-        return ADMIN_PANEL
-    await update.effective_chat.send_message(link, disable_web_page_preview=False)
-    await show_admin_panel(
-        update,
-        context,
-        status_message="Ссылка на Google Sheet отправлена в чат.",
-    )
-    return ADMIN_PANEL
 
 
 async def _handle_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -324,19 +444,24 @@ async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
     data = query.data
     if data == CALLBACK_NEW_EVENT:
         return await _handle_new_event(update, context)
-    if data == CALLBACK_VIEW_REG:
-        return await _handle_view_reg(update, context)
-    if data == CALLBACK_BROADCAST:
-        return await _handle_broadcast(update, context)
-    if data == CALLBACK_WELCOME:
-        return await _handle_welcome(update, context)
-    if data == CALLBACK_OPEN_SHEET:
-        return await _handle_open_sheet(update, context)
+    if data == CALLBACK_SHOW_EVENT:
+        return await _handle_show_event(update, context)
+    if data == CALLBACK_EDIT_DESCRIPTION:
+        return await _handle_edit_description(update, context)
+    if data == CALLBACK_EDIT_TITLE:
+        return await _handle_edit_title(update, context)
+    if data == CALLBACK_EDIT_DATETIME:
+        return await _handle_edit_datetime(update, context)
+    if data == CALLBACK_UPDATE_ZOOM:
+        return await _handle_update_zoom(update, context)
+    if data == CALLBACK_UPDATE_PAYMENT:
+        return await _handle_update_payment(update, context)
+    if data == CALLBACK_LIST_PARTICIPANTS:
+        return await _handle_list_participants(update, context)
     if data == CALLBACK_EXPORT_CSV:
         return await _handle_export(update, context)
-    if data == CALLBACK_REFRESH:
-        await show_admin_panel(update, context)
-        return ADMIN_PANEL
+    if data == CALLBACK_REMIND_ALL:
+        return await _handle_broadcast(update, context)
     await query.answer()
     return ADMIN_PANEL
 
@@ -355,15 +480,82 @@ async def handle_broadcast_text(update: Update, context: ContextTypes.DEFAULT_TY
     return ADMIN_PANEL
 
 
-async def handle_welcome_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def handle_edit_description_text(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
     if not await _ensure_admin(update):
         return ConversationHandler.END
+    if await _ensure_active_event(update, context) is None:
+        return ADMIN_PANEL
+    text = (update.message.text or "").strip()
+    update_settings(description=text)
+    await show_admin_panel(update, context, status_message="Описание обновлено.")
+    return ADMIN_PANEL
+
+
+async def handle_edit_title_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await _ensure_admin(update):
+        return ConversationHandler.END
+    if await _ensure_active_event(update, context) is None:
+        return ADMIN_PANEL
     text = (update.message.text or "").strip()
     if not text:
-        await update.message.reply_text("Приветствие не может быть пустым.")
-        return WAITING_WELCOME
-    settings = update_settings(welcome_text=text)
-    await show_admin_panel(update, context, status_message="Приветствие обновлено.")
+        await show_admin_panel(
+            update,
+            context,
+            status_message="Название не может быть пустым. Попробуйте снова.",
+        )
+        return WAITING_EDIT_TITLE
+    update_settings(topic=text)
+    await show_admin_panel(update, context, status_message="Название обновлено.")
+    return ADMIN_PANEL
+
+
+async def handle_edit_datetime_text(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    if not await _ensure_admin(update):
+        return ConversationHandler.END
+    if await _ensure_active_event(update, context) is None:
+        return ADMIN_PANEL
+    text = (update.message.text or "").strip()
+    try:
+        dt = _parse_datetime(text)
+    except ValueError:
+        await show_admin_panel(
+            update,
+            context,
+            status_message="Не удалось распознать дату. Используйте формат ДД.ММ.ГГГГ ЧЧ:ММ или ДД.ММ ЧЧ:ММ.",
+        )
+        return WAITING_EDIT_DATETIME
+    update_settings(current_event_datetime=dt.isoformat())
+    ensure_scheduler_started()
+    schedule_all_reminders(context.application)
+    await show_admin_panel(update, context, status_message="Дата и время обновлены.")
+    return ADMIN_PANEL
+
+
+async def handle_update_zoom_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await _ensure_admin(update):
+        return ConversationHandler.END
+    if await _ensure_active_event(update, context) is None:
+        return ADMIN_PANEL
+    text = (update.message.text or "").strip()
+    update_settings(zoom_link=text)
+    await show_admin_panel(update, context, status_message="Ссылка на Zoom обновлена.")
+    return ADMIN_PANEL
+
+
+async def handle_update_payment_text(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    if not await _ensure_admin(update):
+        return ConversationHandler.END
+    if await _ensure_active_event(update, context) is None:
+        return ADMIN_PANEL
+    text = (update.message.text or "").strip()
+    update_settings(payment_link=text)
+    await show_admin_panel(update, context, status_message="Ссылка на оплату обновлена.")
     return ADMIN_PANEL
 
 
@@ -482,8 +674,26 @@ def build_admin_conversation() -> ConversationHandler:
         entry_points=[CommandHandler("admin", admin_command_entry)],
         states={
             ADMIN_PANEL: [CallbackQueryHandler(handle_admin_callback, pattern=r"^admin:")],
-            WAITING_BROADCAST: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_broadcast_text)],
-            WAITING_WELCOME: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_welcome_text)],
+            WAITING_BROADCAST: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_broadcast_text)
+            ],
+            WAITING_EDIT_DESCRIPTION: [
+                MessageHandler(
+                    filters.TEXT & ~filters.COMMAND, handle_edit_description_text
+                )
+            ],
+            WAITING_EDIT_TITLE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_edit_title_text)
+            ],
+            WAITING_EDIT_DATETIME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_edit_datetime_text)
+            ],
+            WAITING_EDIT_ZOOM: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_update_zoom_text)
+            ],
+            WAITING_EDIT_PAYMENT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_update_payment_text)
+            ],
             NEW_EVENT_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, new_event_title)],
             NEW_EVENT_DESCRIPTION: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, new_event_description)
