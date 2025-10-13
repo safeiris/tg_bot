@@ -14,6 +14,10 @@ from telegram.ext import (
 
 import database
 from config import is_admin, load_settings
+from message_templates import (
+    build_free_confirmation,
+    build_paid_pending_confirmation,
+)
 
 WAITING_EMAIL, WAITING_FORMAT = range(2)
 FREE_BUTTON = "🆓 Наблюдатель (бесплатно)"
@@ -72,22 +76,15 @@ async def handle_email(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 async def handle_format(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     choice = (update.message.text or "").strip()
     settings = load_settings()
-    payment_link = settings.get("payment_link", "")
-
     if choice == FREE_BUTTON:
         database.update_participation(update.effective_chat.id, "free", "no")
-        await update.message.reply_text(
-            "Вы выбрали формат наблюдателя. Ждите ссылку в день вебинара!",
-            reply_markup=ReplyKeyboardRemove(),
-        )
+        confirmation = build_free_confirmation(settings)
+        await update.message.reply_text(confirmation, reply_markup=ReplyKeyboardRemove())
         return ConversationHandler.END
 
     if choice == PAID_BUTTON:
         database.update_participation(update.effective_chat.id, "paid", "no")
-        if payment_link:
-            message = f"Для оплаты используйте ссылку: {payment_link}"
-        else:
-            message = "Ссылка для оплаты пока не задана. Свяжитесь с организатором."
+        message = build_paid_pending_confirmation(settings)
         await update.message.reply_text(message, reply_markup=ReplyKeyboardRemove())
         return ConversationHandler.END
 
