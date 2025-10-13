@@ -472,12 +472,12 @@ def _set_wizard_step(context: ContextTypes.DEFAULT_TYPE, step: str) -> None:
 
 
 def _wizard_prompt(step: str) -> Optional[str]:
+    # UX update: confirmation screen + cleaned messages
     prompts = {
         WIZARD_STEP_TITLE: "Введи название встречи.",
         WIZARD_STEP_DATETIME: "Введи дату и время в формате ДД.ММ.ГГГГ ЧЧ:ММ.",
-        WIZARD_STEP_ZOOM: "Вставь ссылку на Zoom (или нажми Пропустить).",
-        WIZARD_STEP_PAY: "Вставь ссылку на оплату (или нажми Пропустить).",
-        WIZARD_STEP_READY: "Нажми «✅ Завершить и создать», чтобы сохранить мероприятие.",
+        WIZARD_STEP_ZOOM: "Вставь ссылку на Zoom.",
+        WIZARD_STEP_PAY: "Вставь ссылку на оплату.",
     }
     return prompts.get(step)
 
@@ -523,6 +523,46 @@ def _new_event_keyboard(ready: bool, step: str) -> InlineKeyboardMarkup:
             InlineKeyboardButton("✅ Завершить и создать", callback_data="admin:new:create")
         ])
     return InlineKeyboardMarkup(_add_home_button(rows))
+
+
+async def _send_confirmation_screen(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    # UX update: confirmation screen + cleaned messages
+    chat = update.effective_chat
+    if chat is None:
+        return
+    draft = _draft(context)
+    datetime_label = html.escape(_format_draft_datetime(draft))
+    zoom_value = (draft.get("zoom_url") or "").strip()
+    pay_value = (draft.get("pay_url") or "").strip()
+    zoom_label = html.escape(zoom_value or "«не указана»")
+    pay_label = html.escape(pay_value or "«не указана»")
+    lines = [
+        "🎯 Проверь данные:",
+        "",
+        f"📅 Дата и время: {datetime_label}",
+        f"🔗 Zoom: {zoom_label}",
+        f"💳 Оплата: {pay_label}",
+        "",
+        "Если всё верно — нажми кнопку ниже:",
+    ]
+    keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("✅ Завершить и создать", callback_data="admin:new:create")],
+            [InlineKeyboardButton("🏠 В главное меню", callback_data="nav:main")],
+        ]
+    )
+    try:
+        await context.bot.send_message(
+            chat_id=chat.id,
+            text="\n".join(lines),
+            reply_markup=keyboard,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        logger.debug("Failed to send confirmation screen", exc_info=True)
 
 
 async def _show_new_event(
@@ -696,7 +736,7 @@ async def _handle_new_event_callback(
             except Exception:
                 logger.debug("Failed to send payment skip confirmation", exc_info=True)
         await _show_new_event(update, context)
-        await _prompt_wizard_step(update, context)
+        await _send_confirmation_screen(update, context)
         return
     if data == "admin:new:create":
         draft = _draft(context)
@@ -927,7 +967,7 @@ async def _handle_wizard_message(
         _set_wizard_step(context, WIZARD_STEP_READY)
         _clear_await(context)
         await _show_new_event(update, context)
-        await _prompt_wizard_step(update, context)
+        await _send_confirmation_screen(update, context)
         return
 
 
