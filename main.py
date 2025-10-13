@@ -1,11 +1,11 @@
 """Entry point for the psychology webinar Telegram bot."""
 from __future__ import annotations
 
-from telegram.ext import Application, CallbackQueryHandler, MessageHandler, filters
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, filters
 
 import config
 import database
-from admin_panel import build_admin_conversation, handle_admin_callback
+from admin_panel import admin_command_entry, handle_admin_callback, handle_admin_message
 from handlers import (
     build_conversation_handler,
     feedback_handler,
@@ -25,9 +25,10 @@ def main() -> None:
     application.post_init = _post_init
 
     application.add_handler(build_conversation_handler())
-    application.add_handler(build_admin_conversation())
-    application.add_handler(CallbackQueryHandler(handle_admin_callback, pattern=r"^admin:"))
+    application.add_handler(CommandHandler("admin", admin_command_entry))
+    application.add_handler(CallbackQueryHandler(handle_admin_callback, pattern=r"^(?:admin:|nav:back$)"))
     application.add_handler(CallbackQueryHandler(handle_user_callback, pattern=r"^user:"))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_admin_message))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, feedback_handler))
 
     application.run_polling()
