@@ -101,7 +101,9 @@ async def _ensure_admin(update: Update, *, message: str = "Недостаточ�
 
 def _slugify_topic(topic: str) -> str:
     normalized = unidecode(topic or "").lower()
-    normalized = re.sub(r"[^a-z0-9]+", "-", normalized).strip("-")
+    normalized = re.sub(r"[\s./]+", "-", normalized)
+    normalized = re.sub(r"[^a-z0-9\-_]", "", normalized)
+    normalized = re.sub(r"-+", "-", normalized).strip("-")
     if not normalized:
         normalized = "event"
     return normalized[:MAX_SLUG_LENGTH]
@@ -109,7 +111,8 @@ def _slugify_topic(topic: str) -> str:
 
 def _generate_sheet_name(topic: str, event_dt: datetime) -> str:
     base_slug = _slugify_topic(topic)
-    date_part = event_dt.strftime("%Y-%m-%d")
+    local_dt = event_dt.astimezone(TZ)
+    date_part = local_dt.strftime("%d-%m-%Y")
     candidate = f"{date_part}__{base_slug}"
     suffix = 1
     while database.get_sheet_by_name(candidate) is not None:

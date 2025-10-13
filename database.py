@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import gspread
 import pandas as pd
@@ -19,6 +19,8 @@ from config import (
     load_settings,
 )
 
+from gspread.utils import rowcol_to_a1
+
 
 SCOPES = (
     "https://www.googleapis.com/auth/spreadsheets",
@@ -26,15 +28,20 @@ SCOPES = (
 )
 
 HEADERS = [
-    "timestamp",
+    "Время регистрации",
     "chat_id",
-    "username",
-    "name",
-    "email",
-    "role",
-    "paid",
-    "feedback",
+    "Имя пользователя",
+    "Имя",
+    "Email",
+    "Тип участия",
+    "Статус оплаты",
+    "Обратная связь",
 ]
+
+ROLE_FREE = "Бесплатный"
+ROLE_PAID = "Платный"
+PAYMENT_PAID = "Оплачено"
+PAYMENT_UNPAID = "Не оплачено"
 
 TZ = ZoneInfo(TIMEZONE)
 
@@ -67,11 +74,61 @@ def _open_spreadsheet() -> gspread.Spreadsheet:
     return client.open_by_key(GSPREAD_SHEET_ID)
 
 
-def _ensure_headers(worksheet: gspread.Worksheet) -> None:
-    current_headers = worksheet.row_values(1)
-    if [h.strip() for h in current_headers] == HEADERS:
-        return
-    worksheet.update("1:1", [HEADERS])
+def _ensure_headers(worksheet: gspread.Worksheet) -> List[str]:
+    current_headers = [h.strip() for h in worksheet.row_values(1)]
+    if current_headers != HEADERS:
+        worksheet.update("1:1", [HEADERS])
+        current_headers = HEADERS.copy()
+    return current_headers
+
+
+def _header_map(worksheet: gspread.Worksheet) -> Dict[str, int]:
+    headers = _ensure_headers(worksheet)
+    return {header: idx + 1 for idx, header in enumerate(headers)}
+
+
+def _row_dict(
+    worksheet: gspread.Worksheet, row_idx: int, header_map: Dict[str, int]
+) -> Dict[str, str]:
+    values = worksheet.row_values(row_idx)
+    row_data: Dict[str, str] = {}
+    for header, col_idx in header_map.items():
+        list_idx = col_idx - 1
+        row_data[header] = values[list_idx] if list_idx < len(values) else ""
+    return row_data
+
+
+def _format_role(value: str) -> str:
+    normalized = (value or "").strip().lower()
+    if normalized in {
+        "paid",
+        "платный",
+        "платно",
+        "платная",
+        "платное",
+        "платные",
+        "участник",
+        ROLE_PAID.lower(),
+    }:
+        return ROLE_PAID
+    return ROLE_FREE
+
+
+def _format_payment_status(value: str) -> str:
+    normalized = (value or "").strip().lower()
+    if normalized in {
+        "yes",
+        "y",
+        "true",
+        "1",
+        PAYMENT_PAID.lower(),
+        "оплатил",
+        "оплатила",
+        "оплачен",
+        "оплачена",
+    }:
+        return PAYMENT_PAID
+    return PAYMENT_UNPAID
 
 
 def create_event_sheet(sheet_name: str) -> gspread.Worksheet:
@@ -80,9 +137,7 @@ def create_event_sheet(sheet_name: str) -> gspread.Worksheet:
         worksheet = spreadsheet.worksheet(sheet_name)
     except gspread.exceptions.WorksheetNotFound:
         worksheet = spreadsheet.add_worksheet(title=sheet_name, rows=100, cols=len(HEADERS))
-        worksheet.update("1:1", [HEADERS])
-    else:
-        _ensure_headers(worksheet)
+    _ensure_headers(worksheet)
     return worksheet
 
 
@@ -111,9 +166,18 @@ def _now_timestamp() -> str:
     return datetime.now(TZ).isoformat()
 
 
-def _find_row_by_chat_id(worksheet: gspread.Worksheet, chat_id: int) -> Optional[int]:
+def _find_row_by_chat_id(
+    worksheet: gspread.Worksheet,
+    chat_id: int,
+    header_map: Optional[Dict[str, int]] = None,
+) -> Optional[int]:
     chat_id_str = str(chat_id)
-    values = worksheet.col_values(2)
+    if header_map is None:
+        header_map = _header_map(worksheet)
+    chat_col = header_map.get("chat_id")
+    if not chat_col:
+        return None
+    values = worksheet.col_values(chat_col)
     for idx, value in enumerate(values, start=1):
         if value.strip() == chat_id_str:
             return idx
@@ -129,58 +193,76 @@ def _normalize_username(username: str) -> str:
 
 def register_participant(participant: Participant) -> None:
     worksheet = get_current_worksheet()
-    row_idx = _find_row_by_chat_id(worksheet, participant.chat_id)
+    header_map = _header_map(worksheet)
+    row_idx = _find_row_by_chat_id(worksheet, participant.chat_id, header_map)
     timestamp = _now_timestamp()
     username = _normalize_username(participant.username)
+    data = {header: "" for header in HEADERS}
     if row_idx:
-        existing = worksheet.row_values(row_idx)
-        role = existing[5] if len(existing) > 5 else participant.role
-        paid = existing[6] if len(existing) > 6 else participant.paid
-        feedback = existing[7] if len(existing) > 7 else participant.feedback
-        worksheet.update(
-            f"A{row_idx}:H{row_idx}",
-            [
-                [
-                    timestamp,
-                    str(participant.chat_id),
-                    username,
-                    participant.name,
-                    participant.email,
-                    role or participant.role,
-                    paid or participant.paid,
-                    feedback or participant.feedback,
-                ]
-            ],
-        )
+        data.update(_row_dict(worksheet, row_idx, header_map))
+
+    data.update(
+        {
+            "Время регистрации": timestamp,
+            "chat_id": str(participant.chat_id),
+            "Имя пользователя": username,
+            "Имя": participant.name,
+            "Email": participant.email,
+        }
+    )
+
+    role_value = data.get("Тип участия") or participant.role
+    paid_value = data.get("Статус оплаты") or participant.paid
+    feedback_value = data.get("Обратная связь") or participant.feedback
+
+    data["Тип участия"] = _format_role(role_value)
+    data["Статус оплаты"] = _format_payment_status(paid_value)
+    data["Обратная связь"] = feedback_value
+
+    row_values = [data.get(header, "") for header in HEADERS]
+
+    if row_idx:
+        start = rowcol_to_a1(row_idx, 1)
+        end = rowcol_to_a1(row_idx, len(HEADERS))
+        worksheet.update(f"{start}:{end}", [row_values])
     else:
-        worksheet.append_row(
-            [
-                timestamp,
-                str(participant.chat_id),
-                username,
-                participant.name,
-                participant.email,
-                participant.role,
-                participant.paid,
-                participant.feedback,
-            ]
-        )
+        worksheet.append_row(row_values)
 
 
 def update_participation(chat_id: int, role: str, paid: str) -> None:
     worksheet = get_current_worksheet()
-    row_idx = _find_row_by_chat_id(worksheet, chat_id)
+    header_map = _header_map(worksheet)
+    row_idx = _find_row_by_chat_id(worksheet, chat_id, header_map)
     if not row_idx:
         return
-    worksheet.update(f"F{row_idx}:G{row_idx}", [[role, paid]])
+    role_value = _format_role(role)
+    paid_value = _format_payment_status(paid)
+    role_col = header_map.get("Тип участия")
+    paid_col = header_map.get("Статус оплаты")
+    if not role_col or not paid_col:
+        return
+    start_col = min(role_col, paid_col)
+    end_col = max(role_col, paid_col)
+    start = rowcol_to_a1(row_idx, start_col)
+    end = rowcol_to_a1(row_idx, end_col)
+    if role_col <= paid_col:
+        values = [[role_value, paid_value]]
+    else:
+        values = [[paid_value, role_value]]
+    worksheet.update(f"{start}:{end}", values)
 
 
 def update_feedback(chat_id: int, feedback: str) -> None:
     worksheet = get_current_worksheet()
-    row_idx = _find_row_by_chat_id(worksheet, chat_id)
+    header_map = _header_map(worksheet)
+    row_idx = _find_row_by_chat_id(worksheet, chat_id, header_map)
     if not row_idx:
         return
-    worksheet.update(f"H{row_idx}", feedback)
+    feedback_col = header_map.get("Обратная связь")
+    if not feedback_col:
+        return
+    cell = rowcol_to_a1(row_idx, feedback_col)
+    worksheet.update(cell, feedback)
 
 
 def get_participants(sheet_name: Optional[str] = None) -> pd.DataFrame:
@@ -193,7 +275,11 @@ def get_participants(sheet_name: Optional[str] = None) -> pd.DataFrame:
 
 def list_chat_ids() -> List[int]:
     worksheet = get_current_worksheet()
-    values = worksheet.col_values(2)
+    header_map = _header_map(worksheet)
+    chat_col = header_map.get("chat_id")
+    if not chat_col:
+        return []
+    values = worksheet.col_values(chat_col)
     chat_ids: List[int] = []
     for value in values[1:]:  # skip header
         value = value.strip()
