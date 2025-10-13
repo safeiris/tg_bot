@@ -9,11 +9,15 @@ from apscheduler.triggers.date import DateTrigger
 
 import database
 from config import TIMEZONE, load_settings
+from events import classify_status, get_event
 
 scheduler = AsyncIOScheduler(timezone=ZoneInfo(TIMEZONE))
 
 
-async def _send_bulk_message(application, text: str) -> None:
+async def _send_bulk_message(application, event_id: str, text: str) -> None:
+    event = get_event(event_id)
+    if not event or classify_status(event) == "cancelled":
+        return
     participants = database.get_participants()
     for _, row in participants.iterrows():
         chat_id = row.get("chat_id")
@@ -26,7 +30,10 @@ async def _send_bulk_message(application, text: str) -> None:
         await application.bot.send_message(chat_id=chat_id_int, text=text)
 
 
-async def _send_feedback_request(application, text: str) -> None:
+async def _send_feedback_request(application, event_id: str, text: str) -> None:
+    event = get_event(event_id)
+    if not event or classify_status(event) == "cancelled":
+        return
     participants = database.get_participants()
     waiting_feedback = application.bot_data.setdefault("awaiting_feedback", set())
     for _, row in participants.iterrows():
@@ -60,6 +67,10 @@ def _schedule_job(job_id: str, run_time: datetime, coroutine, *args) -> None:
     )
 
 
+def cancel_scheduled_reminders(event_id: str) -> None:
+    _clear_event_jobs(event_id)
+
+
 def schedule_all_reminders(application) -> None:
     settings = load_settings()
     event_iso = settings.get("current_event_datetime")
@@ -89,13 +100,28 @@ def schedule_all_reminders(application) -> None:
 
     text_day_after = "Спасибо, что были с нами 💕 Поделитесь впечатлениями?"
 
-    _schedule_job(f"{event_id}::day_before", day_before, _send_bulk_message, application, text_day_before)
-    _schedule_job(f"{event_id}::hour_before", hour_before, _send_bulk_message, application, text_hour_before)
+    _schedule_job(
+        f"{event_id}::day_before",
+        day_before,
+        _send_bulk_message,
+        application,
+        event_id,
+        text_day_before,
+    )
+    _schedule_job(
+        f"{event_id}::hour_before",
+        hour_before,
+        _send_bulk_message,
+        application,
+        event_id,
+        text_hour_before,
+    )
     _schedule_job(
         f"{event_id}::feedback",
         day_after,
         _send_feedback_request,
         application,
+        event_id,
         text_day_after,
     )
 

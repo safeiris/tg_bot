@@ -9,6 +9,7 @@ from telegram.ext import ContextTypes
 from zoneinfo import ZoneInfo
 
 from config import TIMEZONE
+from events import classify_status, get_event
 
 TZ = ZoneInfo(TIMEZONE)
 
@@ -20,6 +21,11 @@ async def _deliver_personal_reminder(context: ContextTypes.DEFAULT_TYPE) -> None
     data = job.data or {}
     chat_id = data.get("chat_id")
     message = data.get("message")
+    event_id = data.get("event_id")
+    if event_id:
+        event = get_event(event_id)
+        if not event or classify_status(event) == "cancelled":
+            return
     if not chat_id or not message:
         return
     await context.bot.send_message(chat_id=chat_id, text=message)
@@ -32,6 +38,7 @@ def schedule_personal_reminder(
     run_at: datetime,
     message: str,
     label: str,
+    event_id: Optional[str] = None,
 ) -> Optional[datetime]:
     """Schedule a per-user reminder, replacing previous jobs with the same label."""
 
@@ -41,14 +48,21 @@ def schedule_personal_reminder(
         return None
 
     job_queue = context.application.job_queue
-    job_name = f"user::{chat_id}::{label}"
-    for job in job_queue.get_jobs_by_name(job_name):
-        job.schedule_removal()
+    job_name = (
+        f"event::{event_id}::user::{chat_id}::{label}" if event_id else f"user::{chat_id}::{label}"
+    )
+    for job in list(job_queue.jobs()):
+        name = job.name or ""
+        if name.endswith(f"::{chat_id}::{label}"):
+            job.schedule_removal()
 
+    job_data = {"chat_id": chat_id, "message": message}
+    if event_id:
+        job_data["event_id"] = event_id
     job_queue.run_once(
         _deliver_personal_reminder,
         when=run_at,
-        data={"chat_id": chat_id, "message": message},
+        data=job_data,
         name=job_name,
         chat_id=chat_id,
     )
@@ -57,6 +71,8 @@ def schedule_personal_reminder(
 
 def cancel_personal_reminder(context: ContextTypes.DEFAULT_TYPE, chat_id: int, label: str) -> None:
     job_queue = context.application.job_queue
-    job_name = f"user::{chat_id}::{label}"
-    for job in job_queue.get_jobs_by_name(job_name):
-        job.schedule_removal()
+    suffix = f"::{chat_id}::{label}"
+    for job in list(job_queue.jobs()):
+        name = job.name or ""
+        if name.endswith(suffix):
+            job.schedule_removal()

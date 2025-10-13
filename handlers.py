@@ -283,8 +283,9 @@ async def _handle_reminder(
         return PANEL
 
     settings = load_settings()
+    event_id = str(settings.get("current_event_id") or "")
     event_dt = _get_event_datetime(settings)
-    if not event_dt:
+    if not event_dt or not event_id:
         await _render_user_panel(
             update=update,
             context=context,
@@ -305,6 +306,7 @@ async def _handle_reminder(
         run_at=run_at,
         message=message,
         label=label,
+        event_id=event_id,
     )
     if not scheduled:
         await _render_user_panel(

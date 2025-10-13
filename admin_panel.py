@@ -9,6 +9,7 @@ from typing import Dict, List, Optional
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
+from telegram.helpers import escape_markdown
 from telegram.ext import ContextTypes
 from zoneinfo import ZoneInfo
 
@@ -30,7 +31,11 @@ from events import (
     set_current_event,
     update_event,
 )
-from scheduler import ensure_scheduler_started, schedule_all_reminders
+from scheduler import (
+    cancel_scheduled_reminders,
+    ensure_scheduler_started,
+    schedule_all_reminders,
+)
 
 TZ = ZoneInfo(TIMEZONE)
 PAGE_SIZE = 5
@@ -92,7 +97,42 @@ def _clear_draft(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 def _clear_await(context: ContextTypes.DEFAULT_TYPE) -> None:
-    context.user_data.pop("await", None)
+    context.user_data["await"] = None
+
+
+async def _send_prompt_message(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, text: str
+) -> None:
+    message = update.effective_message
+    if message is not None:
+        await message.reply_text(text)
+        return
+    chat = update.effective_chat
+    if chat is not None:
+        try:
+            await context.bot.send_message(chat_id=chat.id, text=text)
+        except Exception:
+            logger.debug("Failed to deliver prompt message", exc_info=True)
+
+
+def _cancel_event_jobs(context: ContextTypes.DEFAULT_TYPE, event_id: str) -> None:
+    application = context.application
+    if application is None:
+        return
+    job_queue = application.job_queue
+    if job_queue is None:
+        return
+    for job in list(job_queue.jobs()):
+        name = job.name or ""
+        data = job.data if isinstance(job.data, dict) else {}
+        if event_id and event_id in name:
+            job.schedule_removal()
+            continue
+        if isinstance(data, dict) and data.get("event_id") == event_id:
+            job.schedule_removal()
+            continue
+        if name.startswith("user::") and not data:
+            job.schedule_removal()
 
 
 async def _ensure_admin(update: Update) -> bool:
@@ -675,17 +715,21 @@ async def _show_cancel_confirmation(
     if not event:
         await _show_event_list(update, context, page=1, status_message="Событие не найдено.")
         return
-    text = _format_event_detail(event, "Вы уверены, что хотите отменить мероприятие?")
+    question = f"Отменить мероприятие «{html.escape(event.title or '—')}»?"
     keyboard = InlineKeyboardMarkup(
         _add_home_button(
             [
-                [InlineKeyboardButton("✅ Да", callback_data=f"admin:ev:{event_id}:cancel_yes")],
-                [InlineKeyboardButton("❌ Нет", callback_data=f"admin:ev:{event_id}:cancel_no")],
+                [
+                    InlineKeyboardButton(
+                        "Да, отменить", callback_data=f"admin:ev:{event_id}:cancel:yes"
+                    )
+                ],
+                [InlineKeyboardButton("Нет", callback_data=f"admin:ev:{event_id}:back")],
             ]
         )
     )
     _replace_top(context, "event_cancel", event_id=event_id)
-    await _send_panel(update, context, text, keyboard)
+    await _send_panel(update, context, question, keyboard)
 
 
 def _parse_datetime(text: str, timezone: str) -> datetime:
@@ -823,52 +867,46 @@ async def _handle_event_callback(
     view_only_message = "⚠️ Это мероприятие уже прошло.\nЕго можно только просмотреть 💗"
     if action == "edit_title":
         if not editable:
-            await _show_event_menu(update, context, event_id, status_message=view_only_message)
+            await _send_prompt_message(update, context, view_only_message)
             return
-        _clear_await(context)
         context.user_data["await"] = {"type": "ev_edit_title", "event_id": event_id}
-        await _show_event_menu(update, context, event_id, status_message="Введите новое название.")
+        await _send_prompt_message(update, context, "Введи новое название.")
         return
     if action == "edit_desc":
         if not editable:
-            await _show_event_menu(update, context, event_id, status_message=view_only_message)
+            await _send_prompt_message(update, context, view_only_message)
             return
-        _clear_await(context)
         context.user_data["await"] = {"type": "ev_edit_desc", "event_id": event_id}
-        await _show_event_menu(update, context, event_id, status_message="Введите новое описание.")
+        await _send_prompt_message(update, context, "Введи новое описание.")
         return
     if action == "edit_dt":
         if not editable:
-            await _show_event_menu(update, context, event_id, status_message=view_only_message)
+            await _send_prompt_message(update, context, view_only_message)
             return
-        _clear_await(context)
         context.user_data["await"] = {
             "type": "ev_edit_dt",
             "event_id": event_id,
             "timezone": event.timezone or TIMEZONE,
         }
-        await _show_event_menu(
+        await _send_prompt_message(
             update,
             context,
-            event_id,
-            status_message="Укажите дату и время в формате ДД.ММ.ГГГГ ЧЧ:ММ",
+            "Введи дату и время в формате ДД.ММ.ГГГГ ЧЧ:ММ.",
         )
         return
     if action == "edit_zoom":
         if not editable:
-            await _show_event_menu(update, context, event_id, status_message=view_only_message)
+            await _send_prompt_message(update, context, view_only_message)
             return
-        _clear_await(context)
         context.user_data["await"] = {"type": "ev_edit_zoom", "event_id": event_id}
-        await _show_event_menu(update, context, event_id, status_message="Отправьте новую ссылку на Zoom или пустое сообщение.")
+        await _send_prompt_message(update, context, "Отправь новую ссылку на Zoom.")
         return
     if action == "edit_pay":
         if not editable:
-            await _show_event_menu(update, context, event_id, status_message=view_only_message)
+            await _send_prompt_message(update, context, view_only_message)
             return
-        _clear_await(context)
         context.user_data["await"] = {"type": "ev_edit_pay", "event_id": event_id}
-        await _show_event_menu(update, context, event_id, status_message="Отправьте ссылку на оплату или пустое сообщение.")
+        await _send_prompt_message(update, context, "Отправь новую ссылку на оплату.")
         return
     if action == "open_sheet":
         try:
@@ -880,22 +918,22 @@ async def _handle_event_callback(
         return
     if action == "cancel":
         if not editable:
-            await _show_event_menu(update, context, event_id, status_message=view_only_message)
+            await _send_prompt_message(update, context, view_only_message)
             return
         _push_entry(context, "event_cancel", event_id=event_id)
         await _show_cancel_confirmation(update, context, event_id)
         return
-    if action == "cancel_yes":
-        if not editable:
-            await _show_event_menu(update, context, event_id, status_message=view_only_message)
-            return
+    if action == "cancel:yes":
         update_event(event_id, {"status": "cancelled"})
         if get_current_event_id() == event_id:
             set_current_event(None)
-        await _show_event_list(update, context, page=1, status_message="Мероприятие отменено.")
-        return
-    if action == "cancel_no":
-        _pop_entry(context)
+        cancel_scheduled_reminders(event_id)
+        _cancel_event_jobs(context, event_id)
+        await _send_prompt_message(
+            update,
+            context,
+            "🛑 Мероприятие отменено. Все запланированные напоминания сняты.",
+        )
         await _show_event_menu(update, context, event_id)
         return
 
@@ -1204,7 +1242,8 @@ async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYP
     await_state = context.user_data.get("await")
     if not await_state:
         return
-    text = (update.message.text or "").strip()
+    raw_text = update.message.text or ""
+    text = raw_text.strip()
     state_type = await_state.get("type")
     if state_type == "wizard":
         step = str(await_state.get("step") or WIZARD_STEP_TITLE)
@@ -1226,11 +1265,15 @@ async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     if state_type == "ev_edit_title":
         if not text:
-            await update.message.reply_text("Название не может быть пустым. Попробуйте снова.")
+            await update.message.reply_text("Название не может быть пустым. Попробуй снова.")
             return
         update_event(event_id, {"title": text})
         if update.message:
-            await update.message.reply_text(f"✅ Название изменено: {text}")
+            escaped_title = escape_markdown(text, version=2)
+            await update.message.reply_text(
+                f"✅ Название изменено: *{escaped_title}*",
+                parse_mode=ParseMode.MARKDOWN_V2,
+            )
         _clear_await(context)
         await _show_event_menu(update, context, event_id)
         return
@@ -1244,9 +1287,15 @@ async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYP
     if state_type == "ev_edit_dt":
         tz = await_state.get("timezone", TIMEZONE)
         try:
-            dt = _parse_datetime(text, tz)
+            dt = datetime.strptime(text, "%d.%m.%Y %H:%M").replace(tzinfo=ZoneInfo(tz))
         except ValueError:
-            await update.message.reply_text("Не удалось распознать дату. Попробуйте снова.")
+            await update.message.reply_text(
+                "⚠️ Формат даты и времени должен быть ДД.ММ.ГГГГ ЧЧ:ММ. Попробуй снова."
+            )
+            return
+        now_local = datetime.now(ZoneInfo(tz))
+        if dt <= now_local:
+            await update.message.reply_text("⚠️ Эта дата уже прошла. Укажи будущую.")
             return
         update_event(event_id, {"datetime_local": dt.isoformat(), "timezone": tz})
         if get_current_event_id() == event_id:
@@ -1254,7 +1303,11 @@ async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYP
             schedule_all_reminders(context.application)
         if update.message:
             formatted = dt.astimezone(ZoneInfo(tz)).strftime("%d.%m.%Y %H:%M")
-            await update.message.reply_text(f"✅ Новая дата и время: {formatted}")
+            escaped_formatted = escape_markdown(formatted, version=2)
+            await update.message.reply_text(
+                f"✅ Новая дата и время: *{escaped_formatted}*",
+                parse_mode=ParseMode.MARKDOWN_V2,
+            )
         _clear_await(context)
         await _show_event_menu(update, context, event_id)
         return
@@ -1262,7 +1315,10 @@ async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYP
         update_event(event_id, {"zoom_url": text})
         if update.message:
             if text:
-                await update.message.reply_text(f"✅ Zoom-ссылка обновлена: {text}")
+                await update.message.reply_text(
+                    f"✅ Zoom-ссылка обновлена: {text}",
+                    disable_web_page_preview=True,
+                )
             else:
                 await update.message.reply_text("✅ Zoom-ссылка удалена.")
         _clear_await(context)
@@ -1272,7 +1328,10 @@ async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYP
         update_event(event_id, {"pay_url": text})
         if update.message:
             if text:
-                await update.message.reply_text(f"✅ Ссылка на оплату обновлена: {text}")
+                await update.message.reply_text(
+                    f"✅ Ссылка на оплату обновлена: {text}",
+                    disable_web_page_preview=True,
+                )
             else:
                 await update.message.reply_text("✅ Ссылка на оплату удалена.")
         _clear_await(context)
