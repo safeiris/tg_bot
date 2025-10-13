@@ -1,145 +1,233 @@
 diff --git a/admin_panel.py b/admin_panel.py
-index 79529c3c634921e36c2a79f2baa0f28e7513aa76..d5bfa1d0a8ebd7eaeab2d2058e395722d3c34868 100644
+index ba92395af3932c15d172817201a52626dabc9088..cecd645c58180bf2f650a3c85f9ce7408b64923d 100644
 --- a/admin_panel.py
 +++ b/admin_panel.py
-@@ -1,133 +1,181 @@
- """Inline administrative tools for configuring the webinar bot."""
+@@ -1,79 +1,85 @@
+ """Admin inline interface with hierarchical navigation."""
  from __future__ import annotations
  
  import html
++import logging
  import re
  from datetime import datetime
- from typing import Dict, Optional
- from uuid import uuid4
+ from typing import Dict, List, Optional, Tuple
  
  from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
  from telegram.constants import ParseMode
- from telegram.ext import (
-     CallbackQueryHandler,
-     CommandHandler,
-     ContextTypes,
-     ConversationHandler,
-     MessageHandler,
-     filters,
- )
+ from telegram.ext import ContextTypes
  from zoneinfo import ZoneInfo
  
  import database
- from config import TIMEZONE, is_admin, load_settings, update_settings
+ from config import TIMEZONE, is_admin
+ from events import (
+     Event,
+     classify_status,
+     create_event,
++    events_bootstrap,
++    events_refresh_if_stale,
+     get_current_event,
+     get_current_event_id,
+     get_event,
+-    list_events,
++    get_events_page,
+     open_sheet_url,
+     set_current_event,
+     update_event,
+ )
  from scheduler import ensure_scheduler_started, schedule_all_reminders
  
--ADMIN_PANEL, WAITING_BROADCAST, WAITING_WELCOME, NEW_EVENT_TITLE, NEW_EVENT_DESCRIPTION, NEW_EVENT_DATETIME, NEW_EVENT_ZOOM, NEW_EVENT_PAYMENT = range(8)
-+(
-+    ADMIN_PANEL,
-+    WAITING_EDIT_DESCRIPTION,
-+    WAITING_EDIT_TITLE,
-+    WAITING_EDIT_DATETIME,
-+    WAITING_EDIT_ZOOM,
-+    WAITING_EDIT_PAYMENT,
-+    WAITING_BROADCAST,
-+    NEW_EVENT_TITLE,
-+    NEW_EVENT_DESCRIPTION,
-+    NEW_EVENT_DATETIME,
-+    NEW_EVENT_ZOOM,
-+    NEW_EVENT_PAYMENT,
-+) = range(12)
- 
- CALLBACK_NEW_EVENT = "admin:new_event"
--CALLBACK_VIEW_REG = "admin:registrations"
--CALLBACK_BROADCAST = "admin:broadcast"
--CALLBACK_WELCOME = "admin:welcome"
--CALLBACK_OPEN_SHEET = "admin:sheet"
--CALLBACK_EXPORT_CSV = "admin:export"
--CALLBACK_REFRESH = "admin:refresh"
-+CALLBACK_SHOW_EVENT = "admin:show_event"
-+CALLBACK_EDIT_DESCRIPTION = "admin:edit_description"
-+CALLBACK_EDIT_TITLE = "admin:edit_title"
-+CALLBACK_EDIT_DATETIME = "admin:edit_datetime"
-+CALLBACK_UPDATE_ZOOM = "admin:update_zoom"
-+CALLBACK_UPDATE_PAYMENT = "admin:update_payment"
-+CALLBACK_LIST_PARTICIPANTS = "admin:list_participants"
-+CALLBACK_EXPORT_CSV = "admin:export_csv"
-+CALLBACK_REMIND_ALL = "admin:remind_all"
- 
  TZ = ZoneInfo(TIMEZONE)
+ PAGE_SIZE = 5
+ TIMEZONE_PRESETS: List[Tuple[str, str]] = [
+     ("Europe/Moscow", "Europe/Moscow (UTC+3)"),
+     ("Europe/Kaliningrad", "Europe/Kaliningrad (UTC+2)"),
+     ("Europe/Berlin", "Europe/Berlin (UTC+1/+2)"),
+     ("Asia/Almaty", "Asia/Almaty (UTC+6)"),
+     ("Asia/Vladivostok", "Asia/Vladivostok (UTC+10)"),
+     ("UTC", "UTC"),
+ ]
+ 
+ EMOJI_NUMBERS = {
+     1: "1️⃣",
+     2: "2️⃣",
+     3: "3️⃣",
+     4: "4️⃣",
+     5: "5️⃣",
+     6: "6️⃣",
+     7: "7️⃣",
+     8: "8️⃣",
+     9: "9️⃣",
+     10: "🔟",
+ }
  
  
- def _build_admin_keyboard() -> InlineKeyboardMarkup:
-     keyboard = [
--        [InlineKeyboardButton("🆕 Создать мероприятие", callback_data=CALLBACK_NEW_EVENT)],
--        [InlineKeyboardButton("📋 Регистрации", callback_data=CALLBACK_VIEW_REG)],
--        [InlineKeyboardButton("📢 Напомнить всем", callback_data=CALLBACK_BROADCAST)],
--        [InlineKeyboardButton("👋 Приветствие", callback_data=CALLBACK_WELCOME)],
--        [InlineKeyboardButton("📊 Google Sheet", callback_data=CALLBACK_OPEN_SHEET)],
--        [InlineKeyboardButton("⬇️ Экспорт CSV", callback_data=CALLBACK_EXPORT_CSV)],
--        [InlineKeyboardButton("🔄 Обновить", callback_data=CALLBACK_REFRESH)],
-+        [
-+            InlineKeyboardButton(
-+                "🆕 Создать мероприятие", callback_data=CALLBACK_NEW_EVENT
-+            ),
-+            InlineKeyboardButton(
-+                "👁 Текущее мероприятие", callback_data=CALLBACK_SHOW_EVENT
-+            ),
-+        ],
-+        [
-+            InlineKeyboardButton(
-+                "📝 Изменить описание", callback_data=CALLBACK_EDIT_DESCRIPTION
-+            ),
-+            InlineKeyboardButton(
-+                "✏️ Изменить название", callback_data=CALLBACK_EDIT_TITLE
-+            ),
-+        ],
-+        [
-+            InlineKeyboardButton(
-+                "📆 Изменить дату", callback_data=CALLBACK_EDIT_DATETIME
-+            ),
-+            InlineKeyboardButton(
-+                "🔗 Обновить Zoom", callback_data=CALLBACK_UPDATE_ZOOM
-+            ),
-+        ],
-+        [
-+            InlineKeyboardButton(
-+                "💳 Обновить оплату", callback_data=CALLBACK_UPDATE_PAYMENT
-+            ),
-+            InlineKeyboardButton(
-+                "📊 Список участников", callback_data=CALLBACK_LIST_PARTICIPANTS
-+            ),
-+        ],
-+        [
-+            InlineKeyboardButton(
-+                "📥 Экспорт CSV", callback_data=CALLBACK_EXPORT_CSV
-+            ),
-+            InlineKeyboardButton(
-+                "📣 Напомнить всем", callback_data=CALLBACK_REMIND_ALL
-+            ),
-+        ],
-     ]
-     return InlineKeyboardMarkup(keyboard)
++logger = logging.getLogger(__name__)
++
++
+ def _stack(context: ContextTypes.DEFAULT_TYPE) -> List[Dict[str, object]]:
+     return context.user_data.setdefault("admin_nav_stack", [])
  
  
- def _format_value(value: Optional[object]) -> str:
-     if value is None:
-         return "❗️Не указано"
-     if isinstance(value, str):
-         stripped = value.strip()
-         return stripped if stripped else "❗️Не указано"
-     return str(value)
+ def _reset_stack(context: ContextTypes.DEFAULT_TYPE) -> None:
+     context.user_data["admin_nav_stack"] = []
  
  
- def _event_datetime(settings: Dict[str, object]) -> Optional[datetime]:
-     event_iso = settings.get("current_event_datetime")
-     if not event_iso:
-         return None
-     try:
-         return datetime.fromisoformat(str(event_iso))
-     except ValueError:
-         return None
+ def _current_entry(context: ContextTypes.DEFAULT_TYPE) -> Optional[Dict[str, object]]:
+     stack = _stack(context)
+     return stack[-1] if stack else None
  
  
- def _format_datetime(dt: Optional[datetime]) -> str:
+ def _push_entry(context: ContextTypes.DEFAULT_TYPE, screen: str, **data: object) -> None:
+     _stack(context).append({"screen": screen, "data": data})
+ 
+ 
+ def _replace_top(context: ContextTypes.DEFAULT_TYPE, screen: str, **data: object) -> None:
+     stack = _stack(context)
+     if stack:
+         stack[-1] = {"screen": screen, "data": data}
+     else:
+         _push_entry(context, screen, **data)
+ 
+ 
+@@ -86,50 +92,51 @@ def _pop_entry(context: ContextTypes.DEFAULT_TYPE) -> Optional[Dict[str, object]
+ 
+ def _clear_draft(context: ContextTypes.DEFAULT_TYPE) -> None:
+     context.user_data.pop("draft_event", None)
+ 
+ 
+ def _clear_await(context: ContextTypes.DEFAULT_TYPE) -> None:
+     context.user_data.pop("await", None)
+ 
+ 
+ async def _ensure_admin(update: Update) -> bool:
+     user = update.effective_user
+     if user and is_admin(chat_id=user.id, username=user.username):
+         return True
+     if update.callback_query:
+         await update.callback_query.answer("Недостаточно прав", show_alert=True)
+     elif update.message:
+         await update.message.reply_text("Недостаточно прав для выполнения команды.")
+     return False
+ 
+ 
+ async def admin_command_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+     if not await _ensure_admin(update):
+         return
+     _clear_draft(context)
+     _clear_await(context)
++    await _close_wizard_panel(update, context)
+     _reset_stack(context)
+     _push_entry(context, "main")
+     await show_main_menu(update, context)
+ 
+ 
+ async def _send_panel(
+     update: Update,
+     context: ContextTypes.DEFAULT_TYPE,
+     text: str,
+     keyboard: InlineKeyboardMarkup,
+ ) -> None:
+     chat = update.effective_chat
+     chat_id = chat.id if chat else None
+     message_id = context.user_data.get("admin_panel_message_id")
+     if update.callback_query and update.callback_query.message:
+         await update.callback_query.message.edit_text(
+             text,
+             reply_markup=keyboard,
+             parse_mode=ParseMode.HTML,
+             disable_web_page_preview=True,
+         )
+         context.user_data["admin_panel_message_id"] = update.callback_query.message.message_id
+         return
+     if chat_id and message_id:
+         try:
+@@ -141,50 +148,106 @@ async def _send_panel(
+                 parse_mode=ParseMode.HTML,
+                 disable_web_page_preview=True,
+             )
+             return
+         except Exception:
+             pass
+     if update.message:
+         sent = await update.message.reply_text(
+             text,
+             reply_markup=keyboard,
+             parse_mode=ParseMode.HTML,
+             disable_web_page_preview=True,
+         )
+         context.user_data["admin_panel_message_id"] = sent.message_id
+     elif chat_id:
+         sent = await context.bot.send_message(
+             chat_id=chat_id,
+             text=text,
+             reply_markup=keyboard,
+             parse_mode=ParseMode.HTML,
+             disable_web_page_preview=True,
+         )
+         context.user_data["admin_panel_message_id"] = sent.message_id
+ 
+ 
++async def _send_wizard_panel(
++    update: Update,
++    context: ContextTypes.DEFAULT_TYPE,
++    text: str,
++    keyboard: InlineKeyboardMarkup,
++) -> None:
++    chat = update.effective_chat
++    if chat is None:
++        return
++    chat_id = chat.id
++    message_id = context.user_data.get("wizard_message_id")
++    if message_id:
++        try:
++            await context.bot.edit_message_text(
++                chat_id=chat_id,
++                message_id=message_id,
++                text=text,
++                reply_markup=keyboard,
++                parse_mode=ParseMode.HTML,
++                disable_web_page_preview=True,
++            )
++            return
++        except Exception:
++            logger.debug("Failed to edit wizard message, sending a new one", exc_info=True)
++    sent = await context.bot.send_message(
++        chat_id=chat_id,
++        text=text,
++        reply_markup=keyboard,
++        parse_mode=ParseMode.HTML,
++        disable_web_page_preview=True,
++    )
++    context.user_data["wizard_message_id"] = sent.message_id
++
++
++async def _close_wizard_panel(
++    update: Update,
++    context: ContextTypes.DEFAULT_TYPE,
++) -> None:
++    message_id = context.user_data.pop("wizard_message_id", None)
++    chat = update.effective_chat
++    chat_id = chat.id if chat else None
++    if not chat_id or not message_id:
++        return
++    try:
++        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
++    except Exception:
++        try:
++            await context.bot.edit_message_text(
++                chat_id=chat_id,
++                message_id=message_id,
++                text="Визард закрыт.",
++            )
++        except Exception:
++            logger.debug("Unable to close wizard message gracefully", exc_info=True)
++
++
+ def _format_event_datetime(event: Event) -> str:
+     dt = event.parsed_datetime
      if not dt:
          return "❗️Не указано"
-     local_dt = dt.astimezone(TZ)
+     local = dt.astimezone(ZoneInfo(event.timezone or TIMEZONE))
      month_names = [
          "",
          "января",
@@ -155,495 +243,1231 @@ index 79529c3c634921e36c2a79f2baa0f28e7513aa76..d5bfa1d0a8ebd7eaeab2d2058e395722
          "ноября",
          "декабря",
      ]
-     month = month_names[local_dt.month] if 1 <= local_dt.month <= 12 else local_dt.strftime("%B")
-     return f"{local_dt.day} {month} {local_dt.year}, {local_dt.strftime('%H:%M')}"
- 
- 
- def _build_panel_text(settings: Dict[str, object], extra: Optional[str] = None) -> str:
-     topic = html.escape(_format_value(settings.get("topic")))
-     description = html.escape(_format_value(settings.get("description")))
--    welcome = html.escape(_format_value(settings.get("welcome_text")))
--    zoom_link = html.escape(settings.get("zoom_link") or "❗️Не указано")
--    payment_link = html.escape(settings.get("payment_link") or "❗️Не указано")
-+    zoom_link = html.escape(_format_value(settings.get("zoom_link")))
-+    payment_link = html.escape(_format_value(settings.get("payment_link")))
-     dt_text = html.escape(_format_datetime(_event_datetime(settings)))
- 
--    lines = ["<b>Панель администратора</b>"]
--    lines.append(f"👋 Приветствие: {welcome}")
-+    lines = ["<b>Текущее мероприятие</b>"]
-     lines.append(f"🎓 Название: {topic}")
-     lines.append(f"📝 Описание: {description}")
-     lines.append(f"📅 Дата и время: {dt_text}")
-     lines.append(f"🔗 Zoom: {zoom_link}")
-     lines.append(f"💳 Оплата: {payment_link}")
-+    lines.append(f"🌍 Часовой пояс: {html.escape(TIMEZONE)}")
- 
-     sheet_name = settings.get("current_event_sheet_name")
-     if sheet_name:
-         lines.append(f"📊 Активный лист: {html.escape(sheet_name)}")
+     if 1 <= local.month < len(month_names):
+         month = month_names[local.month]
      else:
-         lines.append("📊 Активный лист: не настроен")
-     if extra:
+         month = local.strftime("%B")
+     return f"{local.day} {month} {local.year}, {local.strftime('%H:%M')}"
+@@ -264,89 +327,102 @@ def _list_row(event: Event) -> str:
+     dt = _format_event_datetime(event)
+     status = classify_status(event)
+     status_map = {
+         "active": "",
+         "past": " (прошло)",
+         "cancelled": " (отменено)",
+     }
+     suffix = status_map.get(status, "")
+     return f"{html.escape(event.title or 'Без названия')} — {html.escape(dt)}{suffix}"
+ 
+ 
+ def _list_keyboard(
+     events: List[Event],
+     page: int,
+     total_pages: int,
+ ) -> InlineKeyboardMarkup:
+     rows: List[List[InlineKeyboardButton]] = []
+     if events:
+         buttons: List[InlineKeyboardButton] = []
+         for idx, event in enumerate(events, start=1):
+             label = EMOJI_NUMBERS.get(idx, str(idx))
+             buttons.append(
+                 InlineKeyboardButton(label, callback_data=f"admin:list:pick:{event.event_id}")
+             )
+         rows.append(buttons)
+-    prev_page = max(1, page - 1)
+-    next_page = min(total_pages, page + 1)
+-    rows.append(
+-        [
+-            InlineKeyboardButton(
+-                "◀️ Назад",
+-                callback_data=f"admin:list:page:{prev_page}" if page > 1 else f"admin:list:page:{page}",
+-            ),
+-            InlineKeyboardButton(f"Стр. {page}/{total_pages}", callback_data="admin:list:page:noop"),
+-            InlineKeyboardButton(
+-                "Вперёд ▶️",
+-                callback_data=f"admin:list:page:{next_page}" if page < total_pages else f"admin:list:page:{page}",
+-            ),
+-        ]
+-    )
++    else:
++        rows.append([InlineKeyboardButton("🆕 Новое", callback_data="admin:menu:new")])
++    if events and total_pages > 1:
++        prev_page = max(1, page - 1)
++        next_page = min(total_pages, page + 1)
++        rows.append(
++            [
++                InlineKeyboardButton(
++                    "◀️ Назад",
++                    callback_data=(
++                        f"admin:list:page:{prev_page}" if page > 1 else f"admin:list:page:{page}"
++                    ),
++                ),
++                InlineKeyboardButton(
++                    f"Стр. {page}/{total_pages}", callback_data="admin:list:page:noop"
++                ),
++                InlineKeyboardButton(
++                    "Вперёд ▶️",
++                    callback_data=(
++                        f"admin:list:page:{next_page}" if page < total_pages else f"admin:list:page:{page}"
++                    ),
++                ),
++            ]
++        )
+     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="admin:list:back")])
+     return InlineKeyboardMarkup(rows)
+ 
+ 
+ async def _show_event_list(
+     update: Update,
+     context: ContextTypes.DEFAULT_TYPE,
+     *,
+     page: int = 1,
+     status_message: Optional[str] = None,
+ ) -> None:
+-    events, total_pages, total = list_events(page, PAGE_SIZE)
++    bot_data = context.application.bot_data if context.application else None
++    events_refresh_if_stale(bot_data=bot_data)
++    events, total_pages, total, actual_page = get_events_page(
++        page, PAGE_SIZE, bot_data=bot_data
++    )
+     if events:
+         lines = ["📅 Ваши мероприятия"]
+         for idx, event in enumerate(events, start=1):
+             lines.append(f"{idx}) {_list_row(event)}")
+     else:
+         lines = ["📅 Ваши мероприятия", "Пока событий нет. Создайте новое."]
+     if status_message:
          lines.append("")
-         lines.append(extra)
+         lines.append(status_message)
+     text = "\n".join(lines)
+-    keyboard = _list_keyboard(events, page, total_pages if total else 1)
+-    _replace_top(context, "list", page=page)
++    keyboard = _list_keyboard(events, actual_page, total_pages)
++    _replace_top(context, "list", page=actual_page)
+     await _send_panel(update, context, text, keyboard)
+ 
+ 
+ def _draft(context: ContextTypes.DEFAULT_TYPE) -> Dict[str, object]:
+     draft = context.user_data.setdefault(
+         "draft_event",
+         {
+             "title": "",
+             "description": "",
+             "datetime": None,
+             "timezone": TIMEZONE,
+             "zoom_url": "",
+             "pay_url": "",
+         },
+     )
+     if not draft.get("timezone"):
+         draft["timezone"] = TIMEZONE
+     return draft
+ 
+ 
+ def _format_draft_datetime(draft: Dict[str, object]) -> str:
+     dt: Optional[datetime] = draft.get("datetime")
+     if not dt:
+         return "❗️Не указано"
+     tz = draft.get("timezone") or TIMEZONE
+@@ -387,88 +463,88 @@ def _draft_text(draft: Dict[str, object], status_message: Optional[str] = None)
+ 
+ def _new_event_keyboard(ready: bool) -> InlineKeyboardMarkup:
+     rows = [
+         [InlineKeyboardButton("📛 Название", callback_data="admin:new:title")],
+         [InlineKeyboardButton("📝 Описание", callback_data="admin:new:desc")],
+         [InlineKeyboardButton("📅 Дата и время", callback_data="admin:new:dt")],
+         [InlineKeyboardButton("🔗 Zoom", callback_data="admin:new:zoom")],
+         [InlineKeyboardButton("💳 Оплата", callback_data="admin:new:pay")],
+         [InlineKeyboardButton("🌍 Часовой пояс", callback_data="admin:new:tz")],
+     ]
+     rows.append([InlineKeyboardButton("✅ Завершить и создать", callback_data="admin:new:confirm")])
+     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="nav:back")])
+     return InlineKeyboardMarkup(rows)
+ 
+ 
+ async def _show_new_event(
+     update: Update,
+     context: ContextTypes.DEFAULT_TYPE,
+     *,
+     status_message: Optional[str] = None,
+ ) -> None:
+     draft = _draft(context)
+     ready = bool(draft.get("title") and draft.get("datetime"))
+     text = _draft_text(draft, status_message)
+     _replace_top(context, "new")
+-    await _send_panel(update, context, text, _new_event_keyboard(ready))
++    await _send_wizard_panel(update, context, text, _new_event_keyboard(ready))
+ 
+ 
+ async def _show_timezone_picker(
+     update: Update,
+     context: ContextTypes.DEFAULT_TYPE,
+ ) -> None:
+     draft = _draft(context)
+     current = str(draft.get("timezone") or TIMEZONE)
+     rows = [
+         [
+             InlineKeyboardButton(
+                 ("✅ " if current == tz else "") + label,
+                 callback_data=f"admin:new:tzset:{tz}",
+             )
+         ]
+         for tz, label in TIMEZONE_PRESETS
+     ]
+     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="nav:back")])
+     text = "Выберите часовой пояс"
+     _replace_top(context, "new_tz")
+-    await _send_panel(update, context, text, InlineKeyboardMarkup(rows))
++    await _send_wizard_panel(update, context, text, InlineKeyboardMarkup(rows))
+ 
+ 
+ async def _show_new_confirm(
+     update: Update,
+     context: ContextTypes.DEFAULT_TYPE,
+ ) -> None:
+     draft = _draft(context)
+     text = _draft_text(draft, "Проверьте данные и подтвердите создание.")
+     keyboard = InlineKeyboardMarkup(
+         [
+             [InlineKeyboardButton("✅ Создать", callback_data="admin:new:create")],
+             [InlineKeyboardButton("⬅️ Назад", callback_data="nav:back")],
+         ]
+     )
+     _replace_top(context, "new_confirm")
+-    await _send_panel(update, context, text, keyboard)
++    await _send_wizard_panel(update, context, text, keyboard)
+ 
+ 
+ def _format_event_detail(event: Event, status_message: Optional[str] = None) -> str:
+     card = _format_event_card(event)
+     lines = [card, "", "⚙️ Настройки мероприятия"]
+     if status_message:
+         lines.append("")
+         lines.append(status_message)
      return "\n".join(lines)
  
  
- async def _ensure_admin(update: Update) -> bool:
-     user = update.effective_user
-     if user and is_admin(chat_id=user.id, username=user.username):
-         return True
-     if update.message:
-         await update.message.reply_text("Недостаточно прав для выполнения команды.")
-     elif update.callback_query:
-         await update.callback_query.answer("Недостаточно прав", show_alert=True)
-     return False
+ def _event_menu_keyboard(event: Event) -> InlineKeyboardMarkup:
+     base = f"admin:ev:{event.event_id}"
+     rows = [
+         [InlineKeyboardButton("✏️ Изменить название", callback_data=f"{base}:edit_title")],
+         [InlineKeyboardButton("📝 Изменить описание", callback_data=f"{base}:edit_desc")],
+         [InlineKeyboardButton("📅 Изменить дату и время", callback_data=f"{base}:edit_dt")],
+         [InlineKeyboardButton("🔗 Обновить Zoom", callback_data=f"{base}:edit_zoom")],
+         [InlineKeyboardButton("💳 Обновить оплату", callback_data=f"{base}:edit_pay")],
+         [InlineKeyboardButton("📄 Просмотреть участников", callback_data=f"{base}:open_sheet")],
+         [InlineKeyboardButton("🗑 Отменить мероприятие", callback_data=f"{base}:cancel")],
+         [InlineKeyboardButton("⬅️ Назад", callback_data=f"{base}:back")],
+     ]
+     return InlineKeyboardMarkup(rows)
+ 
+@@ -581,50 +657,55 @@ async def _handle_new_event_callback(
+         _clear_await(context)
+         _push_entry(context, "new_confirm")
+         await _show_new_confirm(update, context)
+         return
+     if data == "admin:new:create":
+         draft = _draft(context)
+         title = (draft.get("title") or "").strip()
+         dt: Optional[datetime] = draft.get("datetime")
+         if not title or not dt:
+             await _show_new_event(update, context, status_message="Недостаточно данных для создания.")
+             return
+         description = (draft.get("description") or "").strip()
+         timezone = str(draft.get("timezone") or TIMEZONE)
+         zoom_url = (draft.get("zoom_url") or "").strip()
+         pay_url = (draft.get("pay_url") or "").strip()
+         event = create_event(
+             title=title,
+             description=description,
+             event_dt=dt,
+             timezone=timezone,
+             zoom_url=zoom_url,
+             pay_url=pay_url,
+         )
+         ensure_scheduler_started()
+         schedule_all_reminders(context.application)
++        try:
++            events_bootstrap(context.application.bot_data if context.application else None)
++        except Exception:
++            logger.exception("Failed to refresh events index after creation")
++        await _close_wizard_panel(update, context)
+         _clear_draft(context)
+         _clear_await(context)
+         _reset_stack(context)
+         _push_entry(context, "main")
+         await _show_main_menu(
+             update,
+             context,
+             status_message=f"Мероприятие создано: {html.escape(event.title)}",
+         )
+         return
  
  
- async def show_admin_panel(
+ async def _handle_event_callback(
      update: Update,
-@@ -198,194 +246,338 @@ def _generate_sheet_name(topic: str, event_dt: datetime) -> str:
-     candidate = f"{date_part}__{base_slug}"
-     suffix = 1
-     while database.get_sheet_by_name(candidate) is not None:
-         suffix += 1
-         candidate = f"{date_part}__{base_slug}-{suffix}"
-     return candidate[:30]
- 
- 
- def _generate_event_id() -> str:
-     return uuid4().hex[:12]
- 
- 
- def _parse_datetime(text: str) -> datetime:
-     variants = ["%d.%m.%Y %H:%M", "%d.%m %H:%M", "%Y-%m-%d %H:%M"]
-     for fmt in variants:
-         try:
-             dt = datetime.strptime(text.strip(), fmt)
-             if fmt == "%d.%m %H:%M":
-                 dt = dt.replace(year=datetime.now(TZ).year)
-             return dt.replace(tzinfo=TZ)
-         except ValueError:
-             continue
-     raise ValueError("invalid datetime")
- 
- 
--async def _handle_view_reg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
--    try:
--        df = database.get_participants()
--    except RuntimeError:
-+def _event_is_configured(settings: Dict[str, object]) -> bool:
-+    return bool(settings.get("current_event_id"))
-+
-+
-+async def _ensure_active_event(
-+    update: Update, context: ContextTypes.DEFAULT_TYPE
-+) -> Optional[Dict[str, object]]:
-+    settings = load_settings()
-+    if not _event_is_configured(settings):
-         await show_admin_panel(
-             update,
-             context,
-             status_message="Активное мероприятие не настроено. Создайте новое событие.",
-         )
-+        return None
-+    return settings
-+
-+
-+async def _handle_show_event(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-+    if update.callback_query:
-+        await update.callback_query.answer()
-+    await show_admin_panel(update, context)
-+    return ADMIN_PANEL
-+
-+
-+async def _handle_edit_description(
-+    update: Update, context: ContextTypes.DEFAULT_TYPE
-+) -> int:
-+    if update.callback_query:
-+        await update.callback_query.answer()
-+    if await _ensure_active_event(update, context) is None:
-         return ADMIN_PANEL
--    total = len(df.index)
--    preview = "\n".join(
--        f"• {row.get('Имя') or row.get('Имя пользователя') or row.get('Email') or '—'}"
--        for _, row in df.head(10).iterrows()
-+    await show_admin_panel(
-+        update,
-+        context,
-+        status_message="Отправьте новый текст описания одним сообщением.",
-     )
--    extra = f"Регистраций: {total}"
--    if preview:
--        extra += f"\nПервые записи:\n{preview}"
--    await show_admin_panel(update, context, status_message=extra)
--    return ADMIN_PANEL
-+    return WAITING_EDIT_DESCRIPTION
- 
- 
--async def _handle_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-+async def _handle_edit_title(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+     context: ContextTypes.DEFAULT_TYPE,
+     event_id: str,
+     action: str,
+ ) -> None:
      if update.callback_query:
          await update.callback_query.answer()
-+    if await _ensure_active_event(update, context) is None:
-+        return ADMIN_PANEL
-     await show_admin_panel(
-         update,
-         context,
--        status_message="Введите текст напоминания, который получат все участники.",
-+        status_message="Введите новое название мероприятия.",
-     )
--    return WAITING_BROADCAST
-+    return WAITING_EDIT_TITLE
-+
-+
-+async def _handle_edit_datetime(
-+    update: Update, context: ContextTypes.DEFAULT_TYPE
-+) -> int:
-+    if update.callback_query:
-+        await update.callback_query.answer()
-+    if await _ensure_active_event(update, context) is None:
-+        return ADMIN_PANEL
-+    await show_admin_panel(
-+        update,
-+        context,
-+        status_message="Укажите новую дату и время в формате ДД.ММ.ГГГГ ЧЧ:ММ или ДД.ММ ЧЧ:ММ.",
-+    )
-+    return WAITING_EDIT_DATETIME
+     if action == "back":
+         _pop_entry(context)
+         await _show_event_list(update, context, page=1)
+         return
+     if action == "edit_title":
+@@ -674,124 +755,183 @@ async def _handle_event_callback(
+         await _show_event_menu(update, context, event_id, status_message=f"Ссылка на участников: {link}")
+         return
+     if action == "cancel":
+         _push_entry(context, "event_cancel", event_id=event_id)
+         await _show_cancel_confirmation(update, context, event_id)
+         return
+     if action == "cancel_yes":
+         update_event(event_id, {"status": "cancelled"})
+         if get_current_event_id() == event_id:
+             set_current_event(None)
+         await _show_event_list(update, context, page=1, status_message="Мероприятие отменено.")
+         return
+     if action == "cancel_no":
+         _pop_entry(context)
+         await _show_event_menu(update, context, event_id)
+         return
  
  
--async def _handle_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-+async def _handle_update_zoom(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+ async def _handle_menu_callback(
+     update: Update,
+     context: ContextTypes.DEFAULT_TYPE,
+     data: str,
+ ) -> None:
      if update.callback_query:
          await update.callback_query.answer()
-+    if await _ensure_active_event(update, context) is None:
-+        return ADMIN_PANEL
-     await show_admin_panel(
-         update,
-         context,
--        status_message="Отправьте новый текст приветствия для участников.",
-+        status_message="Отправьте актуальную ссылку на Zoom (можно оставить пустой).",
-     )
--    return WAITING_WELCOME
-+    return WAITING_EDIT_ZOOM
- 
- 
--async def _handle_open_sheet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-+async def _handle_update_payment(
-+    update: Update, context: ContextTypes.DEFAULT_TYPE
-+) -> int:
-+    if update.callback_query:
-+        await update.callback_query.answer()
-+    if await _ensure_active_event(update, context) is None:
-+        return ADMIN_PANEL
-+    await show_admin_panel(
-+        update,
-+        context,
-+        status_message="Отправьте ссылку на оплату (можно оставить пустой).",
-+    )
-+    return WAITING_EDIT_PAYMENT
-+
-+
-+async def _handle_list_participants(
-+    update: Update, context: ContextTypes.DEFAULT_TYPE
-+) -> int:
-+    if update.callback_query:
-+        await update.callback_query.answer()
-+    if await _ensure_active_event(update, context) is None:
-+        return ADMIN_PANEL
-     try:
--        link = database.get_sheet_link()
-+        df = database.get_participants()
-     except RuntimeError:
-         await show_admin_panel(
-             update,
-             context,
--            status_message="Активный лист не настроен. Создайте мероприятие.",
-+            status_message="Список участников недоступен. Проверьте настройки мероприятия.",
-         )
-         return ADMIN_PANEL
--    await update.effective_chat.send_message(link, disable_web_page_preview=False)
-+    total = len(df.index)
-+    preview = "\n".join(
-+        f"• {row.get('Имя') or row.get('Имя пользователя') or row.get('Email') or '—'}"
-+        for _, row in df.head(10).iterrows()
-+    )
-+    extra = f"Регистраций: {total}"
-+    if preview:
-+        extra += f"\nПервые записи:\n{preview}"
-+    await show_admin_panel(update, context, status_message=extra)
-+    return ADMIN_PANEL
-+
-+
-+async def _handle_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-+    if update.callback_query:
-+        await update.callback_query.answer()
-     await show_admin_panel(
-         update,
-         context,
--        status_message="Ссылка на Google Sheet отправлена в чат.",
-+        status_message="Введите текст напоминания, который получат все участники.",
-     )
--    return ADMIN_PANEL
-+    return WAITING_BROADCAST
- 
- 
- async def _handle_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-     try:
-         path = database.export_database_csv()
-     except RuntimeError:
-         await show_admin_panel(
-             update,
-             context,
-             status_message="Не удалось экспортировать: активное мероприятие не настроено.",
-         )
-         return ADMIN_PANEL
-     await update.effective_chat.send_document(document=path.read_bytes(), filename=path.name)
-     await show_admin_panel(
-         update,
-         context,
-         status_message="CSV-файл со списком участников отправлен.",
-     )
-     return ADMIN_PANEL
- 
- 
- async def _handle_new_event(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-     if update.callback_query:
-         await update.callback_query.answer()
-     context.user_data["new_event"] = {}
-     await show_admin_panel(
-         update,
-         context,
-         status_message="Введите название нового мероприятия.",
-     )
-     return NEW_EVENT_TITLE
- 
- 
- async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-     query = update.callback_query
-     if not query:
-         return ADMIN_PANEL
-     if not await _ensure_admin(update):
-         await query.answer()
-         return ConversationHandler.END
-     data = query.data
-     if data == CALLBACK_NEW_EVENT:
-         return await _handle_new_event(update, context)
--    if data == CALLBACK_VIEW_REG:
--        return await _handle_view_reg(update, context)
--    if data == CALLBACK_BROADCAST:
--        return await _handle_broadcast(update, context)
--    if data == CALLBACK_WELCOME:
--        return await _handle_welcome(update, context)
--    if data == CALLBACK_OPEN_SHEET:
--        return await _handle_open_sheet(update, context)
-+    if data == CALLBACK_SHOW_EVENT:
-+        return await _handle_show_event(update, context)
-+    if data == CALLBACK_EDIT_DESCRIPTION:
-+        return await _handle_edit_description(update, context)
-+    if data == CALLBACK_EDIT_TITLE:
-+        return await _handle_edit_title(update, context)
-+    if data == CALLBACK_EDIT_DATETIME:
-+        return await _handle_edit_datetime(update, context)
-+    if data == CALLBACK_UPDATE_ZOOM:
-+        return await _handle_update_zoom(update, context)
-+    if data == CALLBACK_UPDATE_PAYMENT:
-+        return await _handle_update_payment(update, context)
-+    if data == CALLBACK_LIST_PARTICIPANTS:
-+        return await _handle_list_participants(update, context)
-     if data == CALLBACK_EXPORT_CSV:
-         return await _handle_export(update, context)
--    if data == CALLBACK_REFRESH:
--        await show_admin_panel(update, context)
--        return ADMIN_PANEL
-+    if data == CALLBACK_REMIND_ALL:
-+        return await _handle_broadcast(update, context)
-     await query.answer()
-     return ADMIN_PANEL
- 
- 
- async def handle_broadcast_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-     if not await _ensure_admin(update):
-         return ConversationHandler.END
-     text = (update.message.text or "").strip()
-     if not text:
-         await update.message.reply_text("Сообщение не может быть пустым. Попробуйте снова.")
-         return WAITING_BROADCAST
-     participants = database.list_chat_ids()
-     for chat_id in participants:
-         await context.bot.send_message(chat_id=chat_id, text=text)
-     await show_admin_panel(update, context, status_message="Рассылка успешно отправлена.")
-     return ADMIN_PANEL
- 
- 
--async def handle_welcome_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-+async def handle_edit_description_text(
-+    update: Update, context: ContextTypes.DEFAULT_TYPE
-+) -> int:
-     if not await _ensure_admin(update):
-         return ConversationHandler.END
-+    if await _ensure_active_event(update, context) is None:
-+        return ADMIN_PANEL
-+    text = (update.message.text or "").strip()
-+    update_settings(description=text)
-+    await show_admin_panel(update, context, status_message="Описание обновлено.")
-+    return ADMIN_PANEL
-+
-+
-+async def handle_edit_title_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-+    if not await _ensure_admin(update):
-+        return ConversationHandler.END
-+    if await _ensure_active_event(update, context) is None:
-+        return ADMIN_PANEL
-     text = (update.message.text or "").strip()
-     if not text:
--        await update.message.reply_text("Приветствие не может быть пустым.")
--        return WAITING_WELCOME
--    settings = update_settings(welcome_text=text)
--    await show_admin_panel(update, context, status_message="Приветствие обновлено.")
-+        await show_admin_panel(
-+            update,
-+            context,
-+            status_message="Название не может быть пустым. Попробуйте снова.",
-+        )
-+        return WAITING_EDIT_TITLE
-+    update_settings(topic=text)
-+    await show_admin_panel(update, context, status_message="Название обновлено.")
-+    return ADMIN_PANEL
-+
-+
-+async def handle_edit_datetime_text(
-+    update: Update, context: ContextTypes.DEFAULT_TYPE
-+) -> int:
-+    if not await _ensure_admin(update):
-+        return ConversationHandler.END
-+    if await _ensure_active_event(update, context) is None:
-+        return ADMIN_PANEL
-+    text = (update.message.text or "").strip()
+-    if data == "admin:menu:new":
+-        _clear_draft(context)
+-        _clear_await(context)
+-        _push_entry(context, "new")
+-        await _show_new_event(update, context, status_message="Заполните карточку мероприятия шаг за шагом.")
+-        return
+-    if data == "admin:menu:list":
+-        _clear_await(context)
+-        _push_entry(context, "list", page=1)
+-        await _show_event_list(update, context, page=1)
+-        return
+-    if data == "admin:menu:participants":
+-        current = get_current_event_id()
+-        if not current:
+-            await _show_main_menu(update, context, status_message="Нет активного мероприятия.")
++    await _close_wizard_panel(update, context)
 +    try:
-+        dt = _parse_datetime(text)
-+    except ValueError:
-+        await show_admin_panel(
++        if data == "admin:menu:new":
++            _clear_draft(context)
++            _clear_await(context)
++            _push_entry(context, "new")
++            await _show_new_event(
++                update,
++                context,
++                status_message="Заполните карточку мероприятия шаг за шагом.",
++            )
+             return
+-        link = open_sheet_url(current)
+-        await _show_main_menu(update, context, status_message=f"Ссылка на участников: {link}")
+-        return
+-    if data == "admin:menu:remind":
+-        _clear_await(context)
+-        _push_entry(context, "broadcast")
+-        context.user_data["await"] = {"type": "broadcast"}
+-        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="nav:back")]])
+-        text = "Введите текст напоминания одним сообщением."
+-        await _send_panel(update, context, text, keyboard)
+-        return
++        if data == "admin:menu:list":
++            _clear_await(context)
++            _push_entry(context, "list", page=1)
++            await _show_event_list(update, context, page=1)
++            return
++        if data == "admin:menu:participants":
++            current = get_current_event_id()
++            if not current:
++                await _show_main_menu(
++                    update, context, status_message="Нет активного мероприятия."
++                )
++                return
++            try:
++                link = open_sheet_url(current)
++            except Exception:
++                logger.exception("Failed to open sheet link for %s", current)
++                await _show_main_menu(
++                    update,
++                    context,
++                    status_message="Не удалось получить ссылку на участников.",
++                )
++                return
++            await _show_main_menu(
++                update, context, status_message=f"Ссылка на участников: {link}"
++            )
++            return
++        if data == "admin:menu:remind":
++            _clear_await(context)
++            _push_entry(context, "broadcast")
++            context.user_data["await"] = {"type": "broadcast"}
++            keyboard = InlineKeyboardMarkup(
++                [[InlineKeyboardButton("⬅️ Назад", callback_data="nav:back")]]
++            )
++            text = "Введите текст напоминания одним сообщением."
++            await _send_panel(update, context, text, keyboard)
++            return
++    except Exception:
++        logger.exception("Failed to handle admin menu callback")
++        await _show_main_menu(
++            update, context, status_message="Не удалось обработать запрос. Попробуйте позже."
++        )
+ 
+ 
+ async def _handle_list_callback(
+     update: Update,
+     context: ContextTypes.DEFAULT_TYPE,
+     data: str,
+ ) -> None:
+     if update.callback_query:
+         await update.callback_query.answer()
+-    if data == "admin:list:back":
+-        _pop_entry(context)
+-        await _show_main_menu(update, context)
+-        return
+-    if data.startswith("admin:list:page:"):
+-        parts = data.split(":")
+-        page_part = parts[-1]
+-        entry = _current_entry(context) or {"data": {}}
+-        if page_part == "noop":
+-            page = entry.get("data", {}).get("page", 1)
+-        else:
++    try:
++        if data == "admin:list:back":
++            _pop_entry(context)
++            await _show_main_menu(update, context)
++            return
++        if data.startswith("admin:list:page:"):
++            parts = data.split(":")
++            page_part = parts[-1]
++            entry = _current_entry(context) or {"data": {}}
++            current_page = entry.get("data", {}).get("page", 1)
++            if page_part == "noop":
++                await _show_event_list(update, context, page=current_page)
++                return
+             try:
+-                page = max(1, int(page_part))
++                requested_page = int(page_part)
+             except ValueError:
+-                page = 1
+-        await _show_event_list(update, context, page=page)
+-        return
+-    if data.startswith("admin:list:pick:"):
+-        event_id = data.split(":", 2)[2]
+-        _push_entry(context, "event", event_id=event_id)
+-        await _show_event_menu(update, context, event_id)
+-        return
++                await _show_event_list(
++                    update,
++                    context,
++                    page=current_page,
++                    status_message="Некорректный номер страницы.",
++                )
++                return
++            bot_data = context.application.bot_data if context.application else None
++            events_refresh_if_stale(bot_data=bot_data)
++            _, total_pages, total, actual_page = get_events_page(
++                requested_page, PAGE_SIZE, bot_data=bot_data
++            )
++            if total == 0:
++                await _show_event_list(update, context, page=1)
++                return
++            if requested_page < 1 or requested_page > total_pages:
++                await _show_event_list(
++                    update,
++                    context,
++                    page=actual_page,
++                    status_message="Страница вне диапазона.",
++                )
++                return
++            await _show_event_list(update, context, page=requested_page)
++            return
++        if data.startswith("admin:list:pick:"):
++            event_id = data.split(":", 2)[2]
++            _push_entry(context, "event", event_id=event_id)
++            await _show_event_menu(update, context, event_id)
++            return
++    except Exception:
++        logger.exception("Failed to handle admin list callback")
++        await _show_event_list(
 +            update,
 +            context,
-+            status_message="Не удалось распознать дату. Используйте формат ДД.ММ.ГГГГ ЧЧ:ММ или ДД.ММ ЧЧ:ММ.",
++            page=1,
++            status_message="Не удалось обработать запрос. Попробуйте позже.",
 +        )
-+        return WAITING_EDIT_DATETIME
-+    update_settings(current_event_datetime=dt.isoformat())
-+    ensure_scheduler_started()
-+    schedule_all_reminders(context.application)
-+    await show_admin_panel(update, context, status_message="Дата и время обновлены.")
-+    return ADMIN_PANEL
-+
-+
-+async def handle_update_zoom_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-+    if not await _ensure_admin(update):
-+        return ConversationHandler.END
-+    if await _ensure_active_event(update, context) is None:
-+        return ADMIN_PANEL
-+    text = (update.message.text or "").strip()
-+    update_settings(zoom_link=text)
-+    await show_admin_panel(update, context, status_message="Ссылка на Zoom обновлена.")
-+    return ADMIN_PANEL
-+
-+
-+async def handle_update_payment_text(
-+    update: Update, context: ContextTypes.DEFAULT_TYPE
-+) -> int:
-+    if not await _ensure_admin(update):
-+        return ConversationHandler.END
-+    if await _ensure_active_event(update, context) is None:
-+        return ADMIN_PANEL
-+    text = (update.message.text or "").strip()
-+    update_settings(payment_link=text)
-+    await show_admin_panel(update, context, status_message="Ссылка на оплату обновлена.")
-     return ADMIN_PANEL
  
  
- async def new_event_title(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-     if not await _ensure_admin(update):
-         return ConversationHandler.END
-     text = (update.message.text or "").strip()
-     if not text:
-         await update.message.reply_text("Название не может быть пустым. Попробуйте снова.")
-         return NEW_EVENT_TITLE
-     context.user_data.setdefault("new_event", {})["topic"] = text
-     await show_admin_panel(update, context, status_message="Введите описание мероприятия (можно пропустить пустым сообщением).")
-     return NEW_EVENT_DESCRIPTION
+ async def _handle_nav_back(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+     if update.callback_query:
+         await update.callback_query.answer()
+     entry = _current_entry(context)
+     if not entry:
+         _reset_stack(context)
+         _push_entry(context, "main")
+         await _show_main_menu(update, context)
+         return
+     screen = entry.get("screen")
+     _clear_await(context)
+     if screen == "new":
+         _pop_entry(context)
+         _clear_draft(context)
++        await _close_wizard_panel(update, context)
+         await _show_main_menu(update, context)
+         return
+     if screen in {"new_tz", "new_confirm"}:
+         _pop_entry(context)
+         await _show_new_event(update, context)
+         return
+     if screen == "broadcast":
+         _pop_entry(context)
+         await _show_main_menu(update, context)
+         return
+     if screen == "event_cancel":
+         data = entry.get("data", {})
+         event_id = data.get("event_id") if isinstance(data, dict) else None
+         _pop_entry(context)
+         if event_id:
+             await _show_event_menu(update, context, event_id)
+         else:
+             await _show_event_list(update, context, page=1)
+         return
+     _pop_entry(context)
+     previous = _current_entry(context)
+     if not previous:
+         _reset_stack(context)
+         _push_entry(context, "main")
+         await _show_main_menu(update, context)
+diff --git a/database.py b/database.py
+index ca3062c7b00906c098be026b97c42cefc871fd35..808924b4e8d61abb1bc6fd0f5facafcfac516a15 100644
+--- a/database.py
++++ b/database.py
+@@ -129,50 +129,65 @@ def _format_payment_status(value: str) -> str:
+     }:
+         return PAYMENT_PAID
+     return PAYMENT_UNPAID
  
  
- async def new_event_description(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-     if not await _ensure_admin(update):
-         return ConversationHandler.END
-     text = (update.message.text or "").strip()
-     context.user_data.setdefault("new_event", {})["description"] = text
-     await show_admin_panel(
-         update,
-         context,
-         status_message="Введите дату и время в формате ДД.ММ.ГГГГ ЧЧ:ММ или ДД.ММ ЧЧ:ММ.",
+ def create_event_sheet(sheet_name: str) -> gspread.Worksheet:
+     spreadsheet = _open_spreadsheet()
+     try:
+         worksheet = spreadsheet.worksheet(sheet_name)
+     except gspread.exceptions.WorksheetNotFound:
+         worksheet = spreadsheet.add_worksheet(title=sheet_name, rows=100, cols=len(HEADERS))
+     _ensure_headers(worksheet)
+     return worksheet
+ 
+ 
+ def get_sheet_by_name(sheet_name: str) -> Optional[gspread.Worksheet]:
+     spreadsheet = _open_spreadsheet()
+     try:
+         worksheet = spreadsheet.worksheet(sheet_name)
+     except gspread.exceptions.WorksheetNotFound:
+         return None
+     _ensure_headers(worksheet)
+     return worksheet
+ 
+ 
++def list_event_sheets() -> List[Dict[str, object]]:
++    spreadsheet = _open_spreadsheet()
++    worksheets = spreadsheet.worksheets()
++    sheets: List[Dict[str, object]] = []
++    for worksheet in worksheets:
++        sheets.append(
++            {
++                "sheet_name": worksheet.title,
++                "sheet_id": worksheet.id,
++                "sheet_index": getattr(worksheet, "index", None),
++            }
++        )
++    return sheets
++
++
+ def get_current_worksheet() -> gspread.Worksheet:
+     settings = load_settings()
+     sheet_name = settings.get("current_event_sheet_name")
+     if not sheet_name:
+         raise RuntimeError("Активный лист события не настроен")
+     worksheet = get_sheet_by_name(sheet_name)
+     if worksheet is None:
+         worksheet = create_event_sheet(sheet_name)
+     return worksheet
+ 
+ 
+ def _now_timestamp() -> str:
+     return datetime.now(TZ).isoformat()
+ 
+ 
+ def _find_row_by_chat_id(
+     worksheet: gspread.Worksheet,
+     chat_id: int,
+     header_map: Optional[Dict[str, int]] = None,
+ ) -> Optional[int]:
+     chat_id_str = str(chat_id)
+     if header_map is None:
+         header_map = _header_map(worksheet)
+     chat_col = header_map.get("chat_id")
+     if not chat_col:
+diff --git a/events.py b/events.py
+index f2776bb93e69e6919eff583c53d5e948e98de613..c70e38ebe878c69a60a8ecf26686ab68252f0914 100644
+--- a/events.py
++++ b/events.py
+@@ -1,42 +1,51 @@
+ """Event storage and helpers for the admin panel."""
+ from __future__ import annotations
+ 
+ import json
++import logging
+ import re
+ from dataclasses import dataclass, asdict
+-from datetime import datetime
+-from typing import Dict, Iterable, List, Optional, Tuple
++from datetime import datetime, timedelta
++from typing import Any, Dict, Iterable, List, MutableMapping, Optional, Tuple
+ 
+ from zoneinfo import ZoneInfo
+ 
+ import database
+ from config import DATA_DIR, TIMEZONE, update_settings
+ 
+ 
+ TZ = ZoneInfo(TIMEZONE)
+ EVENTS_FILE = DATA_DIR / "events.json"
++EVENTS_INDEX_FILE = DATA_DIR / "events_index.json"
++
++
++logger = logging.getLogger(__name__)
++
++
++_events_index_cache: Dict[str, Any] = {}
++_bot_data_ref: Optional[MutableMapping[str, Any]] = None
+ 
+ 
+ @dataclass
+ class Event:
+     event_id: str
+     title: str
+     description: str
+     datetime_local: str
+     timezone: str
+     zoom_url: str
+     pay_url: str
+     sheet_name: str
+     sheet_link: str
+     status: str
+     created_at: str
+     updated_at: str
+ 
+     def to_dict(self) -> Dict[str, object]:
+         return asdict(self)
+ 
+     @property
+     def parsed_datetime(self) -> Optional[datetime]:
+         raw = self.datetime_local
+         if not raw:
+             return None
+@@ -82,192 +91,452 @@ def _hydrate_event(item: Dict[str, object]) -> Event:
+         description=str(item.get("description", "")),
+         datetime_local=str(item.get("datetime_local", "")),
+         timezone=str(item.get("timezone", TIMEZONE)),
+         zoom_url=str(item.get("zoom_url", "")),
+         pay_url=str(item.get("pay_url", "")),
+         sheet_name=str(item.get("sheet_name", "")),
+         sheet_link=str(item.get("sheet_link", "")),
+         status=str(item.get("status", "active")),
+         created_at=str(item.get("created_at", datetime.now(TZ).isoformat())),
+         updated_at=str(item.get("updated_at", datetime.now(TZ).isoformat())),
      )
-@@ -460,42 +652,60 @@ async def _finalize_new_event(update: Update, context: ContextTypes.DEFAULT_TYPE
-     return ADMIN_PANEL
  
  
- async def new_event_payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-     if not await _ensure_admin(update):
-         return ConversationHandler.END
-     text = (update.message.text or "").strip()
-     context.user_data.setdefault("new_event", {})["payment_link"] = text
-     return await _finalize_new_event(update, context)
+ def _normalize_events(items: Iterable[Dict[str, object]]) -> List[Event]:
+     return [_hydrate_event(item) for item in items]
  
  
- async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-     if not await _ensure_admin(update):
-         return ConversationHandler.END
-     await update.message.reply_text("Действие отменено.")
-     context.user_data.pop("new_event", None)
-     await show_admin_panel(update, context)
-     return ADMIN_PANEL
+ def _write_events(events: List[Event], current_event_id: Optional[str]) -> None:
+     payload = {
+         "current_event_id": current_event_id,
+         "events": [event.to_dict() for event in events],
+     }
+     _save_payload(payload)
  
  
- def build_admin_conversation() -> ConversationHandler:
-     return ConversationHandler(
-         entry_points=[CommandHandler("admin", admin_command_entry)],
-         states={
-             ADMIN_PANEL: [CallbackQueryHandler(handle_admin_callback, pattern=r"^admin:")],
--            WAITING_BROADCAST: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_broadcast_text)],
--            WAITING_WELCOME: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_welcome_text)],
-+            WAITING_BROADCAST: [
-+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_broadcast_text)
-+            ],
-+            WAITING_EDIT_DESCRIPTION: [
-+                MessageHandler(
-+                    filters.TEXT & ~filters.COMMAND, handle_edit_description_text
++def _resolve_bot_data(
++    bot_data: Optional[MutableMapping[str, Any]] = None,
++) -> Optional[MutableMapping[str, Any]]:
++    global _bot_data_ref
++    if bot_data is not None:
++        _bot_data_ref = bot_data
++        return bot_data
++    return _bot_data_ref
++
++
++def _load_index_file() -> Dict[str, Any]:
++    if not EVENTS_INDEX_FILE.exists():
++        return {}
++    try:
++        raw = EVENTS_INDEX_FILE.read_text(encoding="utf-8")
++    except OSError as exc:
++        logger.warning("Failed to read events index file: %s", exc)
++        return {}
++    try:
++        return json.loads(raw)
++    except json.JSONDecodeError as exc:
++        logger.warning("Failed to parse events index file: %s", exc)
++        return {}
++
++
++def _save_index_file(state: Dict[str, Any]) -> None:
++    _ensure_data_dir()
++    try:
++        EVENTS_INDEX_FILE.write_text(
++            json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8"
++        )
++    except OSError as exc:
++        logger.warning("Failed to write events index file: %s", exc)
++
++
++def _set_index_state(
++    state: Dict[str, Any], bot_data: Optional[MutableMapping[str, Any]] = None
++) -> None:
++    global _events_index_cache
++    _events_index_cache = state
++    resolved = _resolve_bot_data(bot_data)
++    if resolved is not None:
++        resolved["events_index"] = state
++    _save_index_file(state)
++
++
++def _get_index_state(
++    bot_data: Optional[MutableMapping[str, Any]] = None,
++) -> Dict[str, Any]:
++    resolved = _resolve_bot_data(bot_data)
++    if _events_index_cache:
++        return _events_index_cache
++    if resolved and isinstance(resolved.get("events_index"), dict):
++        _events_index_cache.update(resolved["events_index"])
++        return _events_index_cache
++    file_payload = _load_index_file()
++    if file_payload:
++        _events_index_cache.update(file_payload)
++        if resolved is not None:
++            resolved["events_index"] = file_payload
++    return _events_index_cache
++
++
++def _collect_sheet_index() -> Dict[str, Dict[str, Any]]:
++    try:
++        worksheets = database.list_event_sheets()
++    except Exception as exc:  # pragma: no cover - network errors
++        logger.warning("Failed to collect sheet index: %s", exc)
++        return {}
++    result: Dict[str, Dict[str, Any]] = {}
++    for sheet in worksheets:
++        name = str(sheet.get("sheet_name") or sheet.get("title") or "")
++        if not name:
++            continue
++        result[name] = {
++            "sheet_name": name,
++            "sheet_id": sheet.get("sheet_id"),
++            "sheet_index": sheet.get("sheet_index"),
++        }
++    return result
++
++
++def _sorted_events(events: List[Event]) -> List[Event]:
++    ordered = list(events)
++
++    def sort_key(event: Event) -> Tuple[int, float, str]:
++        order = {"active": 0, "past": 1, "cancelled": 2}.get(
++            classify_status(event), 3
++        )
++        dt = event.parsed_datetime
++        ts = dt.timestamp() if dt else 0.0
++        title = (event.title or "").lower()
++        return (order, -ts, title)
++
++    ordered.sort(key=sort_key)
++    return ordered
++
++
++def _placeholder_event_dict(event_id: str) -> Dict[str, Any]:
++    now_iso = datetime.now(TZ).isoformat()
++    return {
++        "event_id": event_id,
++        "title": event_id,
++        "description": "",
++        "datetime_local": "",
++        "timezone": TIMEZONE,
++        "zoom_url": "",
++        "pay_url": "",
++        "sheet_name": event_id,
++        "sheet_link": "",
++        "status": "active",
++        "created_at": now_iso,
++        "updated_at": now_iso,
++    }
++
++
++def _build_index_items(events: List[Event]) -> List[Dict[str, Any]]:
++    sheet_map = _collect_sheet_index()
++    items: List[Dict[str, Any]] = []
++    seen: set[str] = set()
++    for event in _sorted_events(events):
++        sheet_key = event.sheet_name or event.event_id
++        sheet_info = sheet_map.get(sheet_key) or sheet_map.get(event.event_id)
++        items.append(
++            {
++                "event_id": event.event_id,
++                "sheet_name": sheet_info.get("sheet_name") if sheet_info else sheet_key,
++                "sheet_id": sheet_info.get("sheet_id") if sheet_info else None,
++                "sheet_index": sheet_info.get("sheet_index") if sheet_info else None,
++                "event": event.to_dict(),
++            }
++        )
++        seen.add(sheet_key)
++        seen.add(event.event_id)
++    for sheet_name, sheet_info in sheet_map.items():
++        if sheet_name in seen:
++            continue
++        items.append(
++            {
++                "event_id": sheet_name,
++                "sheet_name": sheet_info.get("sheet_name") or sheet_name,
++                "sheet_id": sheet_info.get("sheet_id"),
++                "sheet_index": sheet_info.get("sheet_index"),
++                "event": _placeholder_event_dict(sheet_name),
++            }
++        )
++    return items
++
++
++def _pick_latest_event_id(events: List[Event]) -> Optional[str]:
++    latest_id: Optional[str] = None
++    latest_dt: Optional[datetime] = None
++    for event in events:
++        dt = event.parsed_datetime
++        if not dt:
++            continue
++        if latest_dt is None or dt > latest_dt:
++            latest_dt = dt
++            latest_id = event.event_id
++    if latest_id:
++        return latest_id
++    if events:
++        return events[0].event_id
++    return None
++
++
++def _mark_index_stale() -> None:
++    if isinstance(_events_index_cache, dict):
++        _events_index_cache["fetched_at"] = None
++    resolved = _resolve_bot_data()
++    if resolved and isinstance(resolved.get("events_index"), dict):
++        resolved["events_index"]["fetched_at"] = None
++
++
+ def load_events() -> Tuple[List[Event], Optional[str]]:
+     payload = _load_payload()
+     events = _normalize_events(payload.get("events", []))
+     current_id = payload.get("current_event_id")
+     current_id = str(current_id) if current_id else None
+     return events, current_id
+ 
+ 
+ def _store_events(events: List[Event], current_event_id: Optional[str]) -> None:
+     _write_events(events, current_event_id)
+ 
+ 
+ def get_event(event_id: str) -> Optional[Event]:
+     events, current_id = load_events()
+     for event in events:
+         if event.event_id == event_id:
+             _auto_update_status(events, current_id)
+             return event
+     return None
+ 
+ 
+ def get_current_event_id() -> Optional[str]:
+     _, current_id = load_events()
+     return current_id
+ 
+ 
+ def get_current_event() -> Optional[Event]:
+     current_id = get_current_event_id()
+     if not current_id:
+         return None
+     return get_event(current_id)
+ 
+ 
++def events_bootstrap(
++    bot_data: Optional[MutableMapping[str, Any]] = None,
++) -> Optional[str]:
++    resolved_bot_data = _resolve_bot_data(bot_data)
++    events, stored_current = load_events()
++    items = _build_index_items(events)
++    current_event_id: Optional[str] = None
++    if stored_current and any(event.event_id == stored_current for event in events):
++        current_event_id = stored_current
++    else:
++        current_event_id = _pick_latest_event_id(events)
++        if current_event_id != stored_current:
++            set_current_event(current_event_id)
++    state = {
++        "fetched_at": datetime.now(TZ).isoformat(),
++        "items": items,
++        "current_event_id": current_event_id,
++    }
++    _set_index_state(state, resolved_bot_data)
++    return current_event_id
++
++
+ def set_current_event(event_id: Optional[str]) -> None:
+     events, _ = load_events()
+     _auto_update_status(events, event_id)
+     _store_events(events, event_id)
+     if event_id:
+         event = next((ev for ev in events if ev.event_id == event_id), None)
+     else:
+         event = None
+     if event:
+         worksheet = database.get_or_create_sheet(event.sheet_name)
+         update_settings(
+             topic=event.title,
+             description=event.description,
+             zoom_link=event.zoom_url,
+             payment_link=event.pay_url,
+             current_event_id=event.event_id,
+             current_event_sheet_name=event.sheet_name,
+             current_event_sheet_gid=worksheet.id,
+             current_event_datetime=event.datetime_local,
+             timezone=event.timezone,
+         )
+     else:
+         update_settings(
+             current_event_id=None,
+             current_event_sheet_name=None,
+             current_event_sheet_gid=None,
+             current_event_datetime=None,
+         )
++    _mark_index_stale()
+ 
+ 
+ def _auto_update_status(events: List[Event], current_event_id: Optional[str]) -> None:
+     changed = False
+     now = datetime.now(TZ)
+     for event in events:
+         if event.status == "cancelled":
+             continue
+         dt = event.parsed_datetime
+         if not dt:
+             continue
+         status = "past" if dt < now else "active"
+         if event.status != status:
+             event.status = status
+             event.updated_at = datetime.now(TZ).isoformat()
+             changed = True
+     if changed:
+         _store_events(events, current_event_id)
+ 
+ 
+ def classify_status(event: Event) -> str:
+     if event.status == "cancelled":
+         return "cancelled"
+     dt = event.parsed_datetime
+     if dt is None:
+         return event.status or "active"
+     return "past" if dt < datetime.now(dt.tzinfo or TZ) else "active"
+ 
+ 
++def events_refresh_if_stale(
++    max_age_min: int = 5,
++    *,
++    bot_data: Optional[MutableMapping[str, Any]] = None,
++) -> None:
++    state = _get_index_state(bot_data)
++    fetched_raw = state.get("fetched_at") if isinstance(state, dict) else None
++    if not fetched_raw:
++        events_bootstrap(bot_data)
++        return
++    try:
++        fetched_dt = datetime.fromisoformat(str(fetched_raw))
++    except ValueError:
++        events_bootstrap(bot_data)
++        return
++    if datetime.now(TZ) - fetched_dt >= timedelta(minutes=max_age_min):
++        events_bootstrap(bot_data)
++
++
+ def list_events(
+     page: int,
+     page_size: int,
+     status_filter: Optional[Iterable[str]] = None,
+ ) -> Tuple[List[Event], int, int]:
+     events, current_id = load_events()
+     _auto_update_status(events, current_id)
+     if status_filter is not None:
+         allowed = {status for status in status_filter}
+         filtered = [event for event in events if classify_status(event) in allowed]
+     else:
+         filtered = events
+ 
+     def sort_key(event: Event) -> Tuple[int, float]:
+         order = {"active": 0, "past": 1, "cancelled": 2}.get(
+             classify_status(event), 3
+         )
+         dt = event.parsed_datetime
+         ts = dt.timestamp() if dt else 0.0
+         return (order, -ts)
+ 
+     filtered.sort(key=sort_key)
+     total = len(filtered)
+     if page_size <= 0:
+         page_size = 5
+     total_pages = max(1, (total + page_size - 1) // page_size) if total else 1
+     page = max(1, min(page, total_pages))
+     start = (page - 1) * page_size
+     end = start + page_size
+     return filtered[start:end], total_pages, total
+ 
+ 
++def _hydrate_entry(entry: Dict[str, Any], fallback: Optional[Event] = None) -> Event:
++    if fallback is not None:
++        return fallback
++    payload = entry.get("event") if isinstance(entry, dict) else None
++    if isinstance(payload, dict):
++        return _hydrate_event(payload)
++    return _hydrate_event(_placeholder_event_dict(str(entry.get("event_id"))))
++
++
++def get_events_page(
++    page: int,
++    size: int,
++    *,
++    bot_data: Optional[MutableMapping[str, Any]] = None,
++) -> Tuple[List[Event], int, int, int]:
++    state = _get_index_state(bot_data)
++    if not state:
++        events_bootstrap(bot_data)
++        state = _get_index_state(bot_data)
++    items = state.get("items") if isinstance(state, dict) else None
++    if not isinstance(items, list):
++        items = []
++    total = len(items)
++    if size <= 0:
++        size = 5
++    if total == 0:
++        return [], 0, 0, 1
++    total_pages = (total + size - 1) // size
++    page = max(1, min(page, total_pages))
++    start = (page - 1) * size
++    end = start + size
++    page_items = items[start:end]
++    events, current_id = load_events()
++    _auto_update_status(events, current_id)
++    event_map = {event.event_id: event for event in events}
++    hydrated: List[Event] = []
++    for entry in page_items:
++        event_id = entry.get("event_id") if isinstance(entry, dict) else None
++        fallback = event_map.get(str(event_id)) if event_id else None
++        hydrated.append(_hydrate_entry(entry, fallback))
++    return hydrated, total_pages, total, page
++
++
+ def _find_event_index(events: List[Event], event_id: str) -> int:
+     for idx, event in enumerate(events):
+         if event.event_id == event_id:
+             return idx
+     raise KeyError(event_id)
+ 
+ 
+ def update_event(event_id: str, fields: Dict[str, object]) -> Event:
+     events, current_id = load_events()
+     idx = _find_event_index(events, event_id)
+     event = events[idx]
+     for key, value in fields.items():
+         if not hasattr(event, key):
+             continue
+         setattr(event, key, value if value is not None else getattr(event, key))
+     event.updated_at = datetime.now(TZ).isoformat()
+     events[idx] = event
+     _store_events(events, current_id)
+     if current_id == event_id:
+         set_current_event(event_id)
++    _mark_index_stale()
+     return event
+ 
+ 
+ def create_event_sheet(event_id: str) -> Tuple[str, str]:
+     worksheet = database.get_or_create_sheet(event_id)
+     link = database.get_sheet_link(event_id, worksheet.id)
+     return worksheet.title, link
+ 
+ 
+ def open_sheet_url(event_id: str) -> str:
+     event = get_event(event_id)
+     if not event:
+         raise KeyError(event_id)
+     if event.sheet_link:
+         return event.sheet_link
+     link = database.get_sheet_link(event.sheet_name)
+     update_event(event_id, {"sheet_link": link})
+     return link
+ 
+ 
+ def _slugify(text: str) -> str:
+     normalized = re.sub(r"[^\w\s-]", "", text, flags=re.UNICODE)
+     normalized = normalized.strip().lower()
+     normalized = re.sub(r"[\s./]+", "-", normalized)
+     normalized = re.sub(r"-+", "-", normalized)
+@@ -301,28 +570,29 @@ def create_event(
+     event_id = _generate_event_id(title, event_dt)
+     sheet_name, sheet_link = create_event_sheet(event_id)
+     now_iso = datetime.now(TZ).isoformat()
+     try:
+         tz = ZoneInfo(timezone)
+     except Exception:
+         tz = TZ
+         timezone = TIMEZONE
+     event = Event(
+         event_id=event_id,
+         title=title,
+         description=description,
+         datetime_local=event_dt.astimezone(tz).isoformat(),
+         timezone=timezone,
+         zoom_url=zoom_url,
+         pay_url=pay_url,
+         sheet_name=sheet_name,
+         sheet_link=sheet_link,
+         status="active",
+         created_at=now_iso,
+         updated_at=now_iso,
+     )
+     events.append(event)
+     _store_events(events, current_id)
+     set_current_event(event_id)
++    _mark_index_stale()
+     return event
+ 
+ 
+diff --git a/main.py b/main.py
+index 7377ffdd646fe7c405417d29d8360e608a5541d8..fac24858895d665e5299f8dc01bcb69ef1a8f43b 100644
+--- a/main.py
++++ b/main.py
+@@ -1,81 +1,91 @@
+ """Entry point for the psychology webinar Telegram bot."""
+ from __future__ import annotations
+ 
+ import logging
++from time import monotonic
+ 
+ from telegram import Update
+ from telegram.ext import (
+     Application,
+     CallbackQueryHandler,
+     CommandHandler,
+     ContextTypes,
+     MessageHandler,
+     filters,
+ )
+ 
+ import config
+ import database
+ from admin_panel import admin_command_entry, handle_admin_callback, handle_admin_message
+ from handlers import (
+     build_conversation_handler,
+     feedback_handler,
+     handle_user_callback,
+ )
++from events import events_bootstrap
+ from scheduler import ensure_scheduler_started, schedule_all_reminders
+ 
+ 
+ logger = logging.getLogger(__name__)
+ 
+ 
+ async def _post_init(application: Application) -> None:
+     config.ensure_data_dir()
++    try:
++        events_bootstrap(application.bot_data)
++    except Exception:
++        logger.exception("Failed to bootstrap events index on startup")
+     ensure_scheduler_started()
+     schedule_all_reminders(application)
+ 
+ 
+ async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+     exc = context.error
+     if exc:
+-        logger.error(
+-            "Unhandled exception while processing update: %s",
+-            update,
+-            exc_info=exc,
+-        )
++        logger.exception("Unhandled exception while processing update: %s", update)
+     else:
+         logger.error("Unhandled error without exception while processing update: %s", update)
+     chat_id = None
+     if isinstance(update, Update):
+         chat = update.effective_chat
+         if chat:
+             chat_id = chat.id
+     if chat_id is not None:
+-        try:
+-            await context.bot.send_message(
+-                chat_id=chat_id,
+-                text="⚠️ Внутренняя ошибка. Мы уже разбираемся.",
+-            )
+-        except Exception as send_error:
+-            logger.warning(
+-                "Failed to notify chat %s about internal error: %s",
+-                chat_id,
+-                send_error,
+-            )
++        bot_data = context.application.bot_data if context.application else {}
++        throttles = bot_data.setdefault("error_notices", {})
++        now = monotonic()
++        last_sent = throttles.get(chat_id, 0.0)
++        if now - last_sent >= 5.0:
++            try:
++                await context.bot.send_message(
++                    chat_id=chat_id,
++                    text="⚠️ Внутренняя ошибка. Мы уже разбираемся.",
 +                )
-+            ],
-+            WAITING_EDIT_TITLE: [
-+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_edit_title_text)
-+            ],
-+            WAITING_EDIT_DATETIME: [
-+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_edit_datetime_text)
-+            ],
-+            WAITING_EDIT_ZOOM: [
-+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_update_zoom_text)
-+            ],
-+            WAITING_EDIT_PAYMENT: [
-+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_update_payment_text)
-+            ],
-             NEW_EVENT_TITLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, new_event_title)],
-             NEW_EVENT_DESCRIPTION: [
-                 MessageHandler(filters.TEXT & ~filters.COMMAND, new_event_description)
-             ],
-             NEW_EVENT_DATETIME: [
-                 MessageHandler(filters.TEXT & ~filters.COMMAND, new_event_datetime)
-             ],
-             NEW_EVENT_ZOOM: [MessageHandler(filters.TEXT & ~filters.COMMAND, new_event_zoom)],
-             NEW_EVENT_PAYMENT: [
-                 MessageHandler(filters.TEXT & ~filters.COMMAND, new_event_payment)
-             ],
-         },
-         fallbacks=[CommandHandler("cancel", cancel)],
-         allow_reentry=True,
-     )
++                throttles[chat_id] = now
++            except Exception as send_error:
++                logger.warning(
++                    "Failed to notify chat %s about internal error: %s",
++                    chat_id,
++                    send_error,
++                )
++        else:
++            logger.debug("Skipping error notification for %s due to throttle", chat_id)
+ 
+ 
+ def main() -> None:
+     application = Application.builder().token(config.BOT_TOKEN).build()
+     application.post_init = _post_init
+ 
+     application.add_handler(build_conversation_handler())
+     application.add_handler(CommandHandler("admin", admin_command_entry))
+     application.add_handler(CallbackQueryHandler(handle_admin_callback, pattern=r"^(?:admin:|nav:back$)"))
+     application.add_handler(CallbackQueryHandler(handle_user_callback, pattern=r"^user:"))
+     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_admin_message))
+     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, feedback_handler))
+     application.add_error_handler(_error_handler)
+ 
+     application.run_polling()
+ 
+ 
+ if __name__ == "__main__":
+     main()
 

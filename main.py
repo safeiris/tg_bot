@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+from time import monotonic
 
 from telegram import Update
 from telegram.ext import (
@@ -21,6 +22,7 @@ from handlers import (
     feedback_handler,
     handle_user_callback,
 )
+from events import events_bootstrap
 from scheduler import ensure_scheduler_started, schedule_all_reminders
 
 
@@ -29,6 +31,10 @@ logger = logging.getLogger(__name__)
 
 async def _post_init(application: Application) -> None:
     config.ensure_data_dir()
+    try:
+        events_bootstrap(application.bot_data)
+    except Exception:
+        logger.exception("Failed to bootstrap events index on startup")
     ensure_scheduler_started()
     schedule_all_reminders(application)
 
@@ -36,11 +42,7 @@ async def _post_init(application: Application) -> None:
 async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     exc = context.error
     if exc:
-        logger.error(
-            "Unhandled exception while processing update: %s",
-            update,
-            exc_info=exc,
-        )
+        logger.exception("Unhandled exception while processing update: %s", update)
     else:
         logger.error("Unhandled error without exception while processing update: %s", update)
     chat_id = None
@@ -49,17 +51,25 @@ async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> 
         if chat:
             chat_id = chat.id
     if chat_id is not None:
-        try:
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text="⚠️ Внутренняя ошибка. Мы уже разбираемся.",
-            )
-        except Exception as send_error:
-            logger.warning(
-                "Failed to notify chat %s about internal error: %s",
-                chat_id,
-                send_error,
-            )
+        bot_data = context.application.bot_data if context.application else {}
+        throttles = bot_data.setdefault("error_notices", {})
+        now = monotonic()
+        last_sent = throttles.get(chat_id, 0.0)
+        if now - last_sent >= 5.0:
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text="⚠️ Внутренняя ошибка. Мы уже разбираемся.",
+                )
+                throttles[chat_id] = now
+            except Exception as send_error:
+                logger.warning(
+                    "Failed to notify chat %s about internal error: %s",
+                    chat_id,
+                    send_error,
+                )
+        else:
+            logger.debug("Skipping error notification for %s due to throttle", chat_id)
 
 
 def main() -> None:

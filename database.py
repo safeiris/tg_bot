@@ -151,6 +151,21 @@ def get_sheet_by_name(sheet_name: str) -> Optional[gspread.Worksheet]:
     return worksheet
 
 
+def list_event_sheets() -> List[Dict[str, object]]:
+    spreadsheet = _open_spreadsheet()
+    worksheets = spreadsheet.worksheets()
+    sheets: List[Dict[str, object]] = []
+    for worksheet in worksheets:
+        sheets.append(
+            {
+                "sheet_name": worksheet.title,
+                "sheet_id": worksheet.id,
+                "sheet_index": getattr(worksheet, "index", None),
+            }
+        )
+    return sheets
+
+
 def get_current_worksheet() -> gspread.Worksheet:
     settings = load_settings()
     sheet_name = settings.get("current_event_sheet_name")

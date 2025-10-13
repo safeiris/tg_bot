@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import html
+import logging
 import re
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
@@ -17,10 +18,12 @@ from events import (
     Event,
     classify_status,
     create_event,
+    events_bootstrap,
+    events_refresh_if_stale,
     get_current_event,
     get_current_event_id,
     get_event,
-    list_events,
+    get_events_page,
     open_sheet_url,
     set_current_event,
     update_event,
@@ -50,6 +53,9 @@ EMOJI_NUMBERS = {
     9: "9️⃣",
     10: "🔟",
 }
+
+
+logger = logging.getLogger(__name__)
 
 
 def _stack(context: ContextTypes.DEFAULT_TYPE) -> List[Dict[str, object]]:
@@ -108,6 +114,7 @@ async def admin_command_entry(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     _clear_draft(context)
     _clear_await(context)
+    await _close_wizard_panel(update, context)
     _reset_stack(context)
     _push_entry(context, "main")
     await show_main_menu(update, context)
@@ -161,6 +168,62 @@ async def _send_panel(
             disable_web_page_preview=True,
         )
         context.user_data["admin_panel_message_id"] = sent.message_id
+
+
+async def _send_wizard_panel(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    keyboard: InlineKeyboardMarkup,
+) -> None:
+    chat = update.effective_chat
+    if chat is None:
+        return
+    chat_id = chat.id
+    message_id = context.user_data.get("wizard_message_id")
+    if message_id:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=text,
+                reply_markup=keyboard,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+            return
+        except Exception:
+            logger.debug("Failed to edit wizard message, sending a new one", exc_info=True)
+    sent = await context.bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        reply_markup=keyboard,
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+    context.user_data["wizard_message_id"] = sent.message_id
+
+
+async def _close_wizard_panel(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    message_id = context.user_data.pop("wizard_message_id", None)
+    chat = update.effective_chat
+    chat_id = chat.id if chat else None
+    if not chat_id or not message_id:
+        return
+    try:
+        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text="Визард закрыт.",
+            )
+        except Exception:
+            logger.debug("Unable to close wizard message gracefully", exc_info=True)
 
 
 def _format_event_datetime(event: Event) -> str:
@@ -286,21 +349,30 @@ def _list_keyboard(
                 InlineKeyboardButton(label, callback_data=f"admin:list:pick:{event.event_id}")
             )
         rows.append(buttons)
-    prev_page = max(1, page - 1)
-    next_page = min(total_pages, page + 1)
-    rows.append(
-        [
-            InlineKeyboardButton(
-                "◀️ Назад",
-                callback_data=f"admin:list:page:{prev_page}" if page > 1 else f"admin:list:page:{page}",
-            ),
-            InlineKeyboardButton(f"Стр. {page}/{total_pages}", callback_data="admin:list:page:noop"),
-            InlineKeyboardButton(
-                "Вперёд ▶️",
-                callback_data=f"admin:list:page:{next_page}" if page < total_pages else f"admin:list:page:{page}",
-            ),
-        ]
-    )
+    else:
+        rows.append([InlineKeyboardButton("🆕 Новое", callback_data="admin:menu:new")])
+    if events and total_pages > 1:
+        prev_page = max(1, page - 1)
+        next_page = min(total_pages, page + 1)
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "◀️ Назад",
+                    callback_data=(
+                        f"admin:list:page:{prev_page}" if page > 1 else f"admin:list:page:{page}"
+                    ),
+                ),
+                InlineKeyboardButton(
+                    f"Стр. {page}/{total_pages}", callback_data="admin:list:page:noop"
+                ),
+                InlineKeyboardButton(
+                    "Вперёд ▶️",
+                    callback_data=(
+                        f"admin:list:page:{next_page}" if page < total_pages else f"admin:list:page:{page}"
+                    ),
+                ),
+            ]
+        )
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="admin:list:back")])
     return InlineKeyboardMarkup(rows)
 
@@ -312,7 +384,11 @@ async def _show_event_list(
     page: int = 1,
     status_message: Optional[str] = None,
 ) -> None:
-    events, total_pages, total = list_events(page, PAGE_SIZE)
+    bot_data = context.application.bot_data if context.application else None
+    events_refresh_if_stale(bot_data=bot_data)
+    events, total_pages, total, actual_page = get_events_page(
+        page, PAGE_SIZE, bot_data=bot_data
+    )
     if events:
         lines = ["📅 Ваши мероприятия"]
         for idx, event in enumerate(events, start=1):
@@ -323,8 +399,8 @@ async def _show_event_list(
         lines.append("")
         lines.append(status_message)
     text = "\n".join(lines)
-    keyboard = _list_keyboard(events, page, total_pages if total else 1)
-    _replace_top(context, "list", page=page)
+    keyboard = _list_keyboard(events, actual_page, total_pages)
+    _replace_top(context, "list", page=actual_page)
     await _send_panel(update, context, text, keyboard)
 
 
@@ -409,7 +485,7 @@ async def _show_new_event(
     ready = bool(draft.get("title") and draft.get("datetime"))
     text = _draft_text(draft, status_message)
     _replace_top(context, "new")
-    await _send_panel(update, context, text, _new_event_keyboard(ready))
+    await _send_wizard_panel(update, context, text, _new_event_keyboard(ready))
 
 
 async def _show_timezone_picker(
@@ -430,7 +506,7 @@ async def _show_timezone_picker(
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="nav:back")])
     text = "Выберите часовой пояс"
     _replace_top(context, "new_tz")
-    await _send_panel(update, context, text, InlineKeyboardMarkup(rows))
+    await _send_wizard_panel(update, context, text, InlineKeyboardMarkup(rows))
 
 
 async def _show_new_confirm(
@@ -446,7 +522,7 @@ async def _show_new_confirm(
         ]
     )
     _replace_top(context, "new_confirm")
-    await _send_panel(update, context, text, keyboard)
+    await _send_wizard_panel(update, context, text, keyboard)
 
 
 def _format_event_detail(event: Event, status_message: Optional[str] = None) -> str:
@@ -603,6 +679,11 @@ async def _handle_new_event_callback(
         )
         ensure_scheduler_started()
         schedule_all_reminders(context.application)
+        try:
+            events_bootstrap(context.application.bot_data if context.application else None)
+        except Exception:
+            logger.exception("Failed to refresh events index after creation")
+        await _close_wizard_panel(update, context)
         _clear_draft(context)
         _clear_await(context)
         _reset_stack(context)
@@ -696,33 +777,59 @@ async def _handle_menu_callback(
 ) -> None:
     if update.callback_query:
         await update.callback_query.answer()
-    if data == "admin:menu:new":
-        _clear_draft(context)
-        _clear_await(context)
-        _push_entry(context, "new")
-        await _show_new_event(update, context, status_message="Заполните карточку мероприятия шаг за шагом.")
-        return
-    if data == "admin:menu:list":
-        _clear_await(context)
-        _push_entry(context, "list", page=1)
-        await _show_event_list(update, context, page=1)
-        return
-    if data == "admin:menu:participants":
-        current = get_current_event_id()
-        if not current:
-            await _show_main_menu(update, context, status_message="Нет активного мероприятия.")
+    await _close_wizard_panel(update, context)
+    try:
+        if data == "admin:menu:new":
+            _clear_draft(context)
+            _clear_await(context)
+            _push_entry(context, "new")
+            await _show_new_event(
+                update,
+                context,
+                status_message="Заполните карточку мероприятия шаг за шагом.",
+            )
             return
-        link = open_sheet_url(current)
-        await _show_main_menu(update, context, status_message=f"Ссылка на участников: {link}")
-        return
-    if data == "admin:menu:remind":
-        _clear_await(context)
-        _push_entry(context, "broadcast")
-        context.user_data["await"] = {"type": "broadcast"}
-        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="nav:back")]])
-        text = "Введите текст напоминания одним сообщением."
-        await _send_panel(update, context, text, keyboard)
-        return
+        if data == "admin:menu:list":
+            _clear_await(context)
+            _push_entry(context, "list", page=1)
+            await _show_event_list(update, context, page=1)
+            return
+        if data == "admin:menu:participants":
+            current = get_current_event_id()
+            if not current:
+                await _show_main_menu(
+                    update, context, status_message="Нет активного мероприятия."
+                )
+                return
+            try:
+                link = open_sheet_url(current)
+            except Exception:
+                logger.exception("Failed to open sheet link for %s", current)
+                await _show_main_menu(
+                    update,
+                    context,
+                    status_message="Не удалось получить ссылку на участников.",
+                )
+                return
+            await _show_main_menu(
+                update, context, status_message=f"Ссылка на участников: {link}"
+            )
+            return
+        if data == "admin:menu:remind":
+            _clear_await(context)
+            _push_entry(context, "broadcast")
+            context.user_data["await"] = {"type": "broadcast"}
+            keyboard = InlineKeyboardMarkup(
+                [[InlineKeyboardButton("⬅️ Назад", callback_data="nav:back")]]
+            )
+            text = "Введите текст напоминания одним сообщением."
+            await _send_panel(update, context, text, keyboard)
+            return
+    except Exception:
+        logger.exception("Failed to handle admin menu callback")
+        await _show_main_menu(
+            update, context, status_message="Не удалось обработать запрос. Попробуйте позже."
+        )
 
 
 async def _handle_list_callback(
@@ -732,28 +839,60 @@ async def _handle_list_callback(
 ) -> None:
     if update.callback_query:
         await update.callback_query.answer()
-    if data == "admin:list:back":
-        _pop_entry(context)
-        await _show_main_menu(update, context)
-        return
-    if data.startswith("admin:list:page:"):
-        parts = data.split(":")
-        page_part = parts[-1]
-        entry = _current_entry(context) or {"data": {}}
-        if page_part == "noop":
-            page = entry.get("data", {}).get("page", 1)
-        else:
+    try:
+        if data == "admin:list:back":
+            _pop_entry(context)
+            await _show_main_menu(update, context)
+            return
+        if data.startswith("admin:list:page:"):
+            parts = data.split(":")
+            page_part = parts[-1]
+            entry = _current_entry(context) or {"data": {}}
+            current_page = entry.get("data", {}).get("page", 1)
+            if page_part == "noop":
+                await _show_event_list(update, context, page=current_page)
+                return
             try:
-                page = max(1, int(page_part))
+                requested_page = int(page_part)
             except ValueError:
-                page = 1
-        await _show_event_list(update, context, page=page)
-        return
-    if data.startswith("admin:list:pick:"):
-        event_id = data.split(":", 2)[2]
-        _push_entry(context, "event", event_id=event_id)
-        await _show_event_menu(update, context, event_id)
-        return
+                await _show_event_list(
+                    update,
+                    context,
+                    page=current_page,
+                    status_message="Некорректный номер страницы.",
+                )
+                return
+            bot_data = context.application.bot_data if context.application else None
+            events_refresh_if_stale(bot_data=bot_data)
+            _, total_pages, total, actual_page = get_events_page(
+                requested_page, PAGE_SIZE, bot_data=bot_data
+            )
+            if total == 0:
+                await _show_event_list(update, context, page=1)
+                return
+            if requested_page < 1 or requested_page > total_pages:
+                await _show_event_list(
+                    update,
+                    context,
+                    page=actual_page,
+                    status_message="Страница вне диапазона.",
+                )
+                return
+            await _show_event_list(update, context, page=requested_page)
+            return
+        if data.startswith("admin:list:pick:"):
+            event_id = data.split(":", 2)[2]
+            _push_entry(context, "event", event_id=event_id)
+            await _show_event_menu(update, context, event_id)
+            return
+    except Exception:
+        logger.exception("Failed to handle admin list callback")
+        await _show_event_list(
+            update,
+            context,
+            page=1,
+            status_message="Не удалось обработать запрос. Попробуйте позже.",
+        )
 
 
 async def _handle_nav_back(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -770,6 +909,7 @@ async def _handle_nav_back(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if screen == "new":
         _pop_entry(context)
         _clear_draft(context)
+        await _close_wizard_panel(update, context)
         await _show_main_menu(update, context)
         return
     if screen in {"new_tz", "new_confirm"}:
