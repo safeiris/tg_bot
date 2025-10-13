@@ -11,6 +11,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.helpers import escape_markdown
 from telegram.ext import ContextTypes
+from telegram.error import BadRequest
 from zoneinfo import ZoneInfo
 
 import database
@@ -166,14 +167,33 @@ async def _send_panel(
     chat = update.effective_chat
     chat_id = chat.id if chat else None
     message_id = context.user_data.get("admin_panel_message_id")
-    if update.callback_query and update.callback_query.message:
-        await update.callback_query.message.edit_text(
-            text,
-            reply_markup=keyboard,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
-        context.user_data["admin_panel_message_id"] = update.callback_query.message.message_id
+    msg = update.callback_query.message if update.callback_query else None
+    if msg is None:
+        msg = update.effective_message
+    if msg is not None:
+        context.user_data["admin_panel_message_id"] = msg.message_id
+        current_text = msg.text_html or msg.text or ""
+        target_text = text or ""
+        current_markup = msg.reply_markup.to_dict() if msg.reply_markup else None
+        target_markup = keyboard.to_dict() if keyboard else None
+        same_text = current_text == target_text
+        same_kb = current_markup == target_markup
+        if same_text and same_kb:
+            return
+        try:
+            if same_text and not same_kb:
+                await msg.edit_reply_markup(keyboard)
+            else:
+                await msg.edit_text(
+                    text,
+                    reply_markup=keyboard,
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+        except BadRequest as exc:
+            if "Message is not modified" in str(exc):
+                return
+            raise
         return
     if chat_id and message_id:
         try:
@@ -186,6 +206,9 @@ async def _send_panel(
                 disable_web_page_preview=True,
             )
             return
+        except BadRequest as exc:
+            if "Message is not modified" in str(exc):
+                return
         except Exception:
             pass
     if update.message:
@@ -852,8 +875,10 @@ async def _handle_event_callback(
     event_id: str,
     action: str,
 ) -> None:
-    if update.callback_query:
+    answered = False
+    if update.callback_query and action != "open_sheet":
         await update.callback_query.answer()
+        answered = True
     if action == "back":
         _pop_entry(context)
         await _show_event_list(update, context, page=1)
@@ -912,9 +937,21 @@ async def _handle_event_callback(
         try:
             link = open_sheet_url(event_id)
         except KeyError:
+            if update.callback_query and not answered:
+                await update.callback_query.answer("Ссылка недоступна", show_alert=True)
+                answered = True
             await _show_event_menu(update, context, event_id, status_message="Ссылка недоступна.")
             return
-        await _show_event_menu(update, context, event_id, status_message=f"Ссылка на участников: {link}")
+        if update.callback_query and not answered:
+            await update.callback_query.answer("Ссылку отправила 💌", show_alert=False)
+            answered = True
+        chat = update.effective_chat
+        if chat and context.bot:
+            await context.bot.send_message(
+                chat_id=chat.id,
+                text=f"📄 Ссылка на участников: {link}",
+                disable_web_page_preview=False,
+            )
         return
     if action == "cancel":
         if not editable:
@@ -1014,8 +1051,10 @@ async def _handle_menu_callback(
     context: ContextTypes.DEFAULT_TYPE,
     data: str,
 ) -> None:
-    if update.callback_query:
+    answered = False
+    if update.callback_query and data != "admin:menu:participants":
         await update.callback_query.answer()
+        answered = True
     await _close_wizard_panel(update, context)
     try:
         if data == "admin:menu:new":
@@ -1048,6 +1087,9 @@ async def _handle_menu_callback(
             event = get_active_event() or get_current_event()
             current = event.event_id if event else None
             if not current:
+                if update.callback_query and not answered:
+                    await update.callback_query.answer(show_alert=False)
+                    answered = True
                 await _show_main_menu(
                     update, context, status_message="Нет активного мероприятия."
                 )
@@ -1056,15 +1098,27 @@ async def _handle_menu_callback(
                 link = open_sheet_url(current)
             except Exception:
                 logger.exception("Failed to open sheet link for %s", current)
+                if update.callback_query and not answered:
+                    await update.callback_query.answer(
+                        "Не удалось получить ссылку", show_alert=True
+                    )
+                    answered = True
                 await _show_main_menu(
                     update,
                     context,
                     status_message="Не удалось получить ссылку на участников.",
                 )
                 return
-            await _show_main_menu(
-                update, context, status_message=f"Ссылка на участников: {link}"
-            )
+            if update.callback_query and not answered:
+                await update.callback_query.answer("Ссылку отправила 💌", show_alert=False)
+                answered = True
+            chat = update.effective_chat
+            if chat and context.bot:
+                await context.bot.send_message(
+                    chat_id=chat.id,
+                    text=f"📄 Ссылка на участников: {link}",
+                    disable_web_page_preview=False,
+                )
             return
         if data == "admin:menu:remind":
             _clear_await(context)
