@@ -176,6 +176,9 @@ def _get_index_state(
     return _events_index_cache
 
 
+SHEET_NAME_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}__[\w-]+(?:-\d+)?$")
+
+
 def _collect_sheet_index() -> Dict[str, Dict[str, Any]]:
     try:
         worksheets = database.list_event_sheets()
@@ -186,6 +189,10 @@ def _collect_sheet_index() -> Dict[str, Dict[str, Any]]:
     for sheet in worksheets:
         name = str(sheet.get("sheet_name") or sheet.get("title") or "")
         if not name:
+            continue
+        if name in {"Sheet1", "Лист1"}:
+            continue
+        if not SHEET_NAME_PATTERN.match(name):
             continue
         result[name] = {
             "sheet_name": name,
@@ -373,16 +380,27 @@ def set_current_event(event_id: Optional[str]) -> None:
     _mark_index_stale()
 
 
+def _event_local_datetime(event: Event) -> Optional[datetime]:
+    dt = event.parsed_datetime
+    if dt is None:
+        return None
+    try:
+        tz = dt.tzinfo or ZoneInfo(event.timezone or TIMEZONE)
+    except Exception:
+        tz = TZ
+    return dt.astimezone(tz)
+
+
 def _auto_update_status(events: List[Event], current_event_id: Optional[str]) -> None:
     changed = False
-    now = datetime.now(TZ)
     for event in events:
         if event.status == "cancelled":
             continue
-        dt = event.parsed_datetime
-        if not dt:
+        local_dt = _event_local_datetime(event)
+        if local_dt is None:
             continue
-        status = "past" if dt < now else "active"
+        now_local = datetime.now(local_dt.tzinfo)
+        status = "past" if local_dt.date() < now_local.date() else "active"
         if event.status != status:
             event.status = status
             event.updated_at = datetime.now(TZ).isoformat()
@@ -394,10 +412,11 @@ def _auto_update_status(events: List[Event], current_event_id: Optional[str]) ->
 def classify_status(event: Event) -> str:
     if event.status == "cancelled":
         return "cancelled"
-    dt = event.parsed_datetime
-    if dt is None:
+    local_dt = _event_local_datetime(event)
+    if local_dt is None:
         return event.status or "active"
-    return "past" if dt < datetime.now(dt.tzinfo or TZ) else "active"
+    now_local = datetime.now(local_dt.tzinfo)
+    return "past" if local_dt.date() < now_local.date() else "active"
 
 
 def events_refresh_if_stale(
@@ -521,7 +540,7 @@ def update_event(event_id: str, fields: Dict[str, object]) -> Event:
 def create_event_sheet(event_id: str) -> Tuple[str, str]:
     worksheet = database.get_or_create_sheet(event_id)
     link = database.get_sheet_link(event_id, worksheet.id)
-    return worksheet.title, link
+    return event_id, link
 
 
 def open_sheet_url(event_id: str) -> str:
@@ -530,8 +549,11 @@ def open_sheet_url(event_id: str) -> str:
         raise KeyError(event_id)
     if event.sheet_link:
         return event.sheet_link
-    link = database.get_sheet_link(event.sheet_name)
-    update_event(event_id, {"sheet_link": link})
+    sheet_name, link = create_event_sheet(event.event_id)
+    payload: Dict[str, object] = {"sheet_link": link}
+    if event.sheet_name != sheet_name:
+        payload["sheet_name"] = sheet_name
+    update_event(event_id, payload)
     return link
 
 

@@ -41,21 +41,13 @@ TIMEZONE_PRESETS: List[Tuple[str, str]] = [
     ("UTC", "UTC"),
 ]
 
-EMOJI_NUMBERS = {
-    1: "1️⃣",
-    2: "2️⃣",
-    3: "3️⃣",
-    4: "4️⃣",
-    5: "5️⃣",
-    6: "6️⃣",
-    7: "7️⃣",
-    8: "8️⃣",
-    9: "9️⃣",
-    10: "🔟",
-}
-
-
 logger = logging.getLogger(__name__)
+
+
+def _add_home_button(rows: List[List[InlineKeyboardButton]]) -> List[List[InlineKeyboardButton]]:
+    extended = [list(row) for row in rows]
+    extended.append([InlineKeyboardButton("🏠 В главное меню", callback_data="nav:main")])
+    return extended
 
 
 def _stack(context: ContextTypes.DEFAULT_TYPE) -> List[Dict[str, object]]:
@@ -289,7 +281,7 @@ def _main_menu_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("📄 Просмотр участников", callback_data="admin:menu:participants")],
         [InlineKeyboardButton("📣 Напомнить всем", callback_data="admin:menu:remind")],
     ]
-    return InlineKeyboardMarkup(keyboard)
+    return InlineKeyboardMarkup(_add_home_button(keyboard))
 
 
 async def _show_main_menu(
@@ -342,13 +334,14 @@ def _list_keyboard(
 ) -> InlineKeyboardMarkup:
     rows: List[List[InlineKeyboardButton]] = []
     if events:
-        buttons: List[InlineKeyboardButton] = []
-        for idx, event in enumerate(events, start=1):
-            label = EMOJI_NUMBERS.get(idx, str(idx))
-            buttons.append(
-                InlineKeyboardButton(label, callback_data=f"admin:list:pick:{event.event_id}")
+        for event in events:
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        event.event_id, callback_data=f"admin:list:pick:{event.event_id}"
+                    )
+                ]
             )
-        rows.append(buttons)
     else:
         rows.append([InlineKeyboardButton("🆕 Новое", callback_data="admin:menu:new")])
     if events and total_pages > 1:
@@ -374,7 +367,7 @@ def _list_keyboard(
             ]
         )
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="admin:list:back")])
-    return InlineKeyboardMarkup(rows)
+    return InlineKeyboardMarkup(_add_home_button(rows))
 
 
 async def _show_event_list(
@@ -472,7 +465,7 @@ def _new_event_keyboard(ready: bool) -> InlineKeyboardMarkup:
     ]
     rows.append([InlineKeyboardButton("✅ Завершить и создать", callback_data="admin:new:confirm")])
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="nav:back")])
-    return InlineKeyboardMarkup(rows)
+    return InlineKeyboardMarkup(_add_home_button(rows))
 
 
 async def _show_new_event(
@@ -506,7 +499,9 @@ async def _show_timezone_picker(
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="nav:back")])
     text = "Выберите часовой пояс"
     _replace_top(context, "new_tz")
-    await _send_wizard_panel(update, context, text, InlineKeyboardMarkup(rows))
+    await _send_wizard_panel(
+        update, context, text, InlineKeyboardMarkup(_add_home_button(rows))
+    )
 
 
 async def _show_new_confirm(
@@ -516,10 +511,12 @@ async def _show_new_confirm(
     draft = _draft(context)
     text = _draft_text(draft, "Проверьте данные и подтвердите создание.")
     keyboard = InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("✅ Создать", callback_data="admin:new:create")],
-            [InlineKeyboardButton("⬅️ Назад", callback_data="nav:back")],
-        ]
+        _add_home_button(
+            [
+                [InlineKeyboardButton("✅ Создать", callback_data="admin:new:create")],
+                [InlineKeyboardButton("⬅️ Назад", callback_data="nav:back")],
+            ]
+        )
     )
     _replace_top(context, "new_confirm")
     await _send_wizard_panel(update, context, text, keyboard)
@@ -546,7 +543,7 @@ def _event_menu_keyboard(event: Event) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🗑 Отменить мероприятие", callback_data=f"{base}:cancel")],
         [InlineKeyboardButton("⬅️ Назад", callback_data=f"{base}:back")],
     ]
-    return InlineKeyboardMarkup(rows)
+    return InlineKeyboardMarkup(_add_home_button(rows))
 
 
 async def _show_event_menu(
@@ -576,10 +573,12 @@ async def _show_cancel_confirmation(
         return
     text = _format_event_detail(event, "Вы уверены, что хотите отменить мероприятие?")
     keyboard = InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("✅ Да", callback_data=f"admin:ev:{event_id}:cancel_yes")],
-            [InlineKeyboardButton("❌ Нет", callback_data=f"admin:ev:{event_id}:cancel_no")],
-        ]
+        _add_home_button(
+            [
+                [InlineKeyboardButton("✅ Да", callback_data=f"admin:ev:{event_id}:cancel_yes")],
+                [InlineKeyboardButton("❌ Нет", callback_data=f"admin:ev:{event_id}:cancel_no")],
+            ]
+        )
     )
     _replace_top(context, "event_cancel", event_id=event_id)
     await _send_panel(update, context, text, keyboard)
@@ -820,7 +819,7 @@ async def _handle_menu_callback(
             _push_entry(context, "broadcast")
             context.user_data["await"] = {"type": "broadcast"}
             keyboard = InlineKeyboardMarkup(
-                [[InlineKeyboardButton("⬅️ Назад", callback_data="nav:back")]]
+                _add_home_button([[InlineKeyboardButton("⬅️ Назад", callback_data="nav:back")]])
             )
             text = "Введите текст напоминания одним сообщением."
             await _send_panel(update, context, text, keyboard)
@@ -948,6 +947,17 @@ async def _handle_nav_back(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await _show_new_event(update, context)
 
 
+async def _handle_nav_main(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.callback_query:
+        await update.callback_query.answer()
+    _clear_await(context)
+    _clear_draft(context)
+    await _close_wizard_panel(update, context)
+    _reset_stack(context)
+    _push_entry(context, "main")
+    await _show_main_menu(update, context)
+
+
 async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     if not query:
@@ -972,6 +982,9 @@ async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
         return
     if data == "nav:back":
         await _handle_nav_back(update, context)
+        return
+    if data == "nav:main":
+        await _handle_nav_main(update, context)
         return
 
 
