@@ -15,7 +15,7 @@ from telegram.ext import (
 )
 
 import database
-from config import ADMIN_CHAT_ID, load_settings, update_settings
+from config import is_admin, load_settings, update_settings
 from scheduler import ensure_scheduler_started, schedule_all_reminders
 
 MENU_KEYBOARD = ReplyKeyboardMarkup(
@@ -32,7 +32,17 @@ STATE_TOPIC, STATE_DATE, STATE_ZOOM, STATE_PAYMENT, STATE_NOTIFY = range(5)
 
 def _is_admin(update: Update) -> bool:
     user = update.effective_user
-    return bool(user and user.id == ADMIN_CHAT_ID)
+    return bool(user and is_admin(chat_id=user.id, username=user.username))
+
+
+async def _ensure_admin(update: Update, *, message: str = "Недостаточно прав.") -> bool:
+    if _is_admin(update):
+        return True
+    if update.message:
+        await update.message.reply_text(message)
+    else:
+        await update.effective_chat.send_message(message)
+    return False
 
 
 async def send_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -52,15 +62,14 @@ async def send_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def admin_command_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not _is_admin(update):
-        await update.message.reply_text("Эта команда доступна только администратору.")
+    if not await _ensure_admin(update, message="Эта команда доступна только администратору."):
         return ConversationHandler.END
     await send_admin_panel(update, context)
     return ConversationHandler.END
 
 
 async def set_topic_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not _is_admin(update):
+    if not await _ensure_admin(update):
         return ConversationHandler.END
     await update.message.reply_text(
         "Введите новую тему и описание через символ \"|\".\n"
@@ -71,7 +80,7 @@ async def set_topic_start(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def set_topic_finish(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not _is_admin(update):
+    if not await _ensure_admin(update):
         return ConversationHandler.END
     payload = (update.message.text or "").split("|", maxsplit=1)
     topic = payload[0].strip() if payload else ""
@@ -96,7 +105,7 @@ def _parse_datetime(text: str) -> datetime:
 
 
 async def set_date_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not _is_admin(update):
+    if not await _ensure_admin(update):
         return ConversationHandler.END
     await update.message.reply_text(
         "Введите дату и время в формате ДД.ММ.ГГГГ ЧЧ:ММ или ДД.ММ ЧЧ:ММ",
@@ -106,7 +115,7 @@ async def set_date_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def set_date_finish(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not _is_admin(update):
+    if not await _ensure_admin(update):
         return ConversationHandler.END
     text = update.message.text or ""
     try:
@@ -123,14 +132,14 @@ async def set_date_finish(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def set_zoom_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not _is_admin(update):
+    if not await _ensure_admin(update):
         return ConversationHandler.END
     await update.message.reply_text("Отправьте новую Zoom-ссылку:", reply_markup=ReplyKeyboardRemove())
     return STATE_ZOOM
 
 
 async def set_zoom_finish(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not _is_admin(update):
+    if not await _ensure_admin(update):
         return ConversationHandler.END
     link = (update.message.text or "").strip()
     update_settings(zoom_link=link)
@@ -140,14 +149,14 @@ async def set_zoom_finish(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def set_payment_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not _is_admin(update):
+    if not await _ensure_admin(update):
         return ConversationHandler.END
     await update.message.reply_text("Отправьте ссылку на оплату (Robokassa):", reply_markup=ReplyKeyboardRemove())
     return STATE_PAYMENT
 
 
 async def set_payment_finish(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not _is_admin(update):
+    if not await _ensure_admin(update):
         return ConversationHandler.END
     link = (update.message.text or "").strip()
     update_settings(payment_link=link)
@@ -156,8 +165,7 @@ async def set_payment_finish(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def export_participants(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not _is_admin(update):
-        await update.message.reply_text("Недостаточно прав.")
+    if not await _ensure_admin(update):
         return ConversationHandler.END
     path = database.export_database()
     await update.message.reply_document(document=path.read_bytes(), filename=Path(path).name)
@@ -165,7 +173,7 @@ async def export_participants(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def notify_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not _is_admin(update):
+    if not await _ensure_admin(update):
         return ConversationHandler.END
     await update.message.reply_text(
         "Введите текст напоминания, который будет отправлен всем участникам:",
@@ -175,7 +183,7 @@ async def notify_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
 
 async def notify_finish(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if not _is_admin(update):
+    if not await _ensure_admin(update):
         return ConversationHandler.END
     text = update.message.text or ""
     participants = database.list_chat_ids()

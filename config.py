@@ -3,12 +3,18 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional, Tuple
 
 # Bot credentials and application level constants
 BOT_TOKEN: str = "8334419696:AAFrH3-0nUn518KogBviZ-Qquvl6QtHwyDU"
-# Replace with the administrator chat ID that should have access to privileged commands.
-ADMIN_CHAT_ID: int = 123456789
+
+# Administrators who can access privileged commands.
+ADMINS: Tuple[Dict[str, Any], ...] = (
+    {
+        "chat_id": 7740254761,
+        "username": "z_ivan89",
+    },
+)
 
 # Storage locations
 DATA_DIR = Path("data")
@@ -21,6 +27,21 @@ _DEFAULT_SETTINGS: Dict[str, Any] = {
     "zoom_link": "",
     "payment_link": "",
 }
+
+
+def is_admin(chat_id: Optional[int] = None, username: Optional[str] = None) -> bool:
+    """Return True if provided identifiers match a known administrator."""
+
+    normalized_username = (username or "").lstrip("@").lower()
+    for admin in ADMINS:
+        admin_chat_id = admin.get("chat_id")
+        admin_username = (admin.get("username") or "").lstrip("@").lower()
+
+        if chat_id is not None and admin_chat_id == chat_id:
+            return True
+        if normalized_username and admin_username and normalized_username == admin_username:
+            return True
+    return False
 
 
 def ensure_data_dir() -> None:

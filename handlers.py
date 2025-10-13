@@ -13,7 +13,7 @@ from telegram.ext import (
 )
 
 import database
-from config import ADMIN_CHAT_ID, load_settings
+from config import is_admin, load_settings
 
 WAITING_EMAIL, WAITING_FORMAT = range(2)
 FREE_BUTTON = "🆓 Наблюдатель (бесплатно)"
@@ -24,7 +24,7 @@ EMAIL_REGEX = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user = update.effective_user
-    if user and user.id == ADMIN_CHAT_ID:
+    if user and is_admin(chat_id=user.id, username=user.username):
         from admin_panel import send_admin_panel
 
         await send_admin_panel(update, context)
