@@ -1,6 +1,7 @@
 """Inline user interaction handlers for the psychology webinar bot."""
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -27,6 +28,9 @@ EMAIL_REGEX = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 PANEL, WAITING_EMAIL, WAITING_FEEDBACK = range(3)
 
 _conversation_handler: ConversationHandler | None = None
+
+
+logger = logging.getLogger(__name__)
 
 
 def _update_conversation_state(update: Update, new_state: object) -> None:
@@ -210,9 +214,30 @@ async def _refresh_panel_from_state(
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user = update.effective_user
     if user and is_admin(chat_id=user.id, username=user.username):
-        from admin_panel import show_admin_panel
+        import admin_panel
 
-        await show_admin_panel(update, context)
+        renderer = getattr(admin_panel, "show_admin_panel", None)
+        if renderer is None:
+            renderer = getattr(admin_panel, "show_main_menu", None)
+        if renderer is None:
+            logger.error("Admin panel renderer is unavailable in admin_panel module")
+            chat = update.effective_chat
+            if chat:
+                await context.bot.send_message(
+                    chat_id=chat.id,
+                    text="⚠️ Внутренняя ошибка UI админа…",
+                )
+            return ConversationHandler.END
+        try:
+            await renderer(update, context)
+        except Exception:
+            logger.exception("Failed to render admin panel during /start")
+            chat = update.effective_chat
+            if chat:
+                await context.bot.send_message(
+                    chat_id=chat.id,
+                    text="⚠️ Внутренняя ошибка UI админа…",
+                )
         return ConversationHandler.END
 
     await _render_user_panel(update=update, context=context)

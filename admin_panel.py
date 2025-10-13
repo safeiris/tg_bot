@@ -110,7 +110,7 @@ async def admin_command_entry(update: Update, context: ContextTypes.DEFAULT_TYPE
     _clear_await(context)
     _reset_stack(context)
     _push_entry(context, "main")
-    await _show_main_menu(update, context)
+    await show_main_menu(update, context)
 
 
 async def _send_panel(
@@ -238,6 +238,26 @@ async def _show_main_menu(
     event = get_current_event()
     text = _format_event_card(event, status_message)
     await _send_panel(update, context, text, _main_menu_keyboard())
+
+
+async def show_main_menu(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    status_message: Optional[str] = None,
+) -> None:
+    """Public entry point to render the admin main menu."""
+    await _show_main_menu(update, context, status_message=status_message)
+
+
+async def show_admin_panel(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    status_message: Optional[str] = None,
+) -> None:
+    """Backward-compatible alias for :func:`show_main_menu`."""
+    await show_main_menu(update, context, status_message=status_message)
 
 
 def _list_row(event: Event) -> str:
