@@ -162,72 +162,39 @@ async def _send_panel(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     text: str,
-    keyboard: InlineKeyboardMarkup,
+    reply_markup: InlineKeyboardMarkup,
 ) -> None:
-    chat = update.effective_chat
-    chat_id = chat.id if chat else None
-    message_id = context.user_data.get("admin_panel_message_id")
-    msg = update.callback_query.message if update.callback_query else None
-    if msg is None:
-        msg = update.effective_message
-    if msg is not None:
-        context.user_data["admin_panel_message_id"] = msg.message_id
-        current_text = msg.text_html or msg.text or ""
-        target_text = text or ""
-        current_markup = msg.reply_markup.to_dict() if msg.reply_markup else None
-        target_markup = keyboard.to_dict() if keyboard else None
-        same_text = current_text == target_text
-        same_kb = current_markup == target_markup
-        if same_text and same_kb:
-            return
+    q = getattr(update, "callback_query", None)
+    msg = q.message if q else getattr(update, "effective_message", None)
+
+    # Если вызвано из колбэка — пробуем редактировать сообщение бота
+    if q and msg:
         try:
-            if same_text and not same_kb:
-                await msg.edit_reply_markup(keyboard)
-            else:
-                await msg.edit_text(
-                    text,
-                    reply_markup=keyboard,
-                    parse_mode=ParseMode.HTML,
-                    disable_web_page_preview=True,
-                )
-        except BadRequest as exc:
-            if "Message is not modified" in str(exc):
-                return
-            raise
-        return
-    if chat_id and message_id:
-        try:
-            await context.bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=message_id,
-                text=text,
-                reply_markup=keyboard,
+            await q.answer()  # снимаем "часики"
+            await msg.edit_text(
+                text,
+                reply_markup=reply_markup,
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
             )
             return
-        except BadRequest as exc:
-            if "Message is not modified" in str(exc):
-                return
-        except Exception:
-            pass
-    if update.message:
-        sent = await update.message.reply_text(
-            text,
-            reply_markup=keyboard,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
-        context.user_data["admin_panel_message_id"] = sent.message_id
-    elif chat_id:
-        sent = await context.bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            reply_markup=keyboard,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
-        context.user_data["admin_panel_message_id"] = sent.message_id
+        except BadRequest as e:
+            if "can't be edited" in str(e).lower() or "not modified" in str(e).lower():
+                pass  # пойдём на создание нового
+            else:
+                raise
+
+    # Иначе — просто отправляем новое сообщение
+    chat = update.effective_chat
+    if not chat:
+        return
+
+    await chat.send_message(
+        text,
+        reply_markup=reply_markup,
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
 
 
 async def _send_wizard_panel(
@@ -1288,6 +1255,8 @@ async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
     if data == "nav:main":
         await _handle_nav_main(update, context)
         return
+
+    await query.answer()
 
 
 async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
