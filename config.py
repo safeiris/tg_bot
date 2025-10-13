@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 # Bot credentials and application level constants
-BOT_TOKEN: str = "8334419696:AAFrH3-0nUn518KogBviZ-Qquvl6QtHwyDU"
+BOT_TOKEN: str = "8439661494:AAG5nqW5raGjVjocSX6L8oCS1hZngqdq-Uo"
 
 # Administrators who can access privileged commands.
 ADMINS: Tuple[Dict[str, Any], ...] = (
