@@ -16,6 +16,14 @@ ADMINS: Tuple[Dict[str, Any], ...] = (
     },
 )
 
+
+# === Google Sheets Integration ===
+GSPREAD_CREDENTIALS_PATH = "./service_account.json"
+GSPREAD_SHEET_ID = "1f5bRTFlKQ3FD-u0cggKj-87HdXNzMwz_H8imefFaNmI"
+TIMEZONE = "Europe/Moscow"
+
+
+
 # Storage locations
 DATA_DIR = Path("data")
 SETTINGS_FILE = DATA_DIR / "config.json"
