@@ -1229,13 +1229,17 @@ async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYP
             await update.message.reply_text("Название не может быть пустым. Попробуйте снова.")
             return
         update_event(event_id, {"title": text})
+        if update.message:
+            await update.message.reply_text(f"✅ Название изменено: {text}")
         _clear_await(context)
-        await _show_event_menu(update, context, event_id, status_message="Название обновлено.")
+        await _show_event_menu(update, context, event_id)
         return
     if state_type == "ev_edit_desc":
         update_event(event_id, {"description": text})
+        if update.message:
+            await update.message.reply_text("✅ Описание обновлено.")
         _clear_await(context)
-        await _show_event_menu(update, context, event_id, status_message="Описание обновлено.")
+        await _show_event_menu(update, context, event_id)
         return
     if state_type == "ev_edit_dt":
         tz = await_state.get("timezone", TIMEZONE)
@@ -1248,16 +1252,29 @@ async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYP
         if get_current_event_id() == event_id:
             ensure_scheduler_started()
             schedule_all_reminders(context.application)
+        if update.message:
+            formatted = dt.astimezone(ZoneInfo(tz)).strftime("%d.%m.%Y %H:%M")
+            await update.message.reply_text(f"✅ Новая дата и время: {formatted}")
         _clear_await(context)
-        await _show_event_menu(update, context, event_id, status_message="Дата и время обновлены.")
+        await _show_event_menu(update, context, event_id)
         return
     if state_type == "ev_edit_zoom":
         update_event(event_id, {"zoom_url": text})
+        if update.message:
+            if text:
+                await update.message.reply_text(f"✅ Zoom-ссылка обновлена: {text}")
+            else:
+                await update.message.reply_text("✅ Zoom-ссылка удалена.")
         _clear_await(context)
-        await _show_event_menu(update, context, event_id, status_message="Ссылка Zoom обновлена.")
+        await _show_event_menu(update, context, event_id)
         return
     if state_type == "ev_edit_pay":
         update_event(event_id, {"pay_url": text})
+        if update.message:
+            if text:
+                await update.message.reply_text(f"✅ Ссылка на оплату обновлена: {text}")
+            else:
+                await update.message.reply_text("✅ Ссылка на оплату удалена.")
         _clear_await(context)
-        await _show_event_menu(update, context, event_id, status_message="Ссылка на оплату обновлена.")
+        await _show_event_menu(update, context, event_id)
         return
