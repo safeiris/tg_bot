@@ -46,12 +46,19 @@ async def handle_email(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
     user = update.effective_user
     participant = database.Participant(
-        name=user.full_name,
-        username=f"@{user.username}" if user.username else "",
+        name=(user.full_name or "") if user else "",
+        username=f"@{user.username}" if user and user.username else "",
         chat_id=update.effective_chat.id,
         email=email,
     )
-    database.add_or_update_participant(participant)
+    try:
+        database.register_participant(participant)
+    except RuntimeError:
+        await update.message.reply_text(
+            "Регистрация временно недоступна. Пожалуйста, попробуйте позже.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return ConversationHandler.END
 
     await update.message.reply_text(
         "Вы зарегистрированы на вебинар 💫 Ссылка придёт в день проведения.",
@@ -68,7 +75,7 @@ async def handle_format(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     payment_link = settings.get("payment_link", "")
 
     if choice == FREE_BUTTON:
-        database.update_participation(update.effective_chat.id, "free", "нет")
+        database.update_participation(update.effective_chat.id, "free", "no")
         await update.message.reply_text(
             "Вы выбрали формат наблюдателя. Ждите ссылку в день вебинара!",
             reply_markup=ReplyKeyboardRemove(),
@@ -76,7 +83,7 @@ async def handle_format(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         return ConversationHandler.END
 
     if choice == PAID_BUTTON:
-        database.update_participation(update.effective_chat.id, "paid", "ожидает оплаты")
+        database.update_participation(update.effective_chat.id, "paid", "no")
         if payment_link:
             message = f"Для оплаты используйте ссылку: {payment_link}"
         else:

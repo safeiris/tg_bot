@@ -1,13 +1,19 @@
 diff --git a/admin_panel.py b/admin_panel.py
-index 3ba29db6d581b89a3d445adc0d67c46b229827b8..79a81bc2f1db38f6aaeb78d13a4a643cac0f8c25 100644
+index 2931ad7229a8c3d1c4d737b99d0c58ef38326ba6..846f43a312febc92695b2ce07cf6266ddb37d2a3 100644
 --- a/admin_panel.py
 +++ b/admin_panel.py
-@@ -1,88 +1,224 @@
- """Administrative tools for configuring the webinar bot."""
+@@ -1,493 +1,731 @@
+-"""Administrative tools for configuring the webinar bot."""
++"""Administrative tools for configuring the webinar bot with Google Sheets storage."""
  from __future__ import annotations
  
++import html
++import re
  from datetime import datetime
- from pathlib import Path
+-from pathlib import Path
+-from urllib.parse import urlparse
++from typing import Dict, Optional
++from uuid import uuid4
  
  from telegram import ReplyKeyboardMarkup, ReplyKeyboardRemove, Update
  from telegram.constants import ParseMode
@@ -19,189 +25,413 @@ index 3ba29db6d581b89a3d445adc0d67c46b229827b8..79a81bc2f1db38f6aaeb78d13a4a643c
      filters,
  )
  
++from unidecode import unidecode
++from zoneinfo import ZoneInfo
++
  import database
- from config import is_admin, load_settings, update_settings
+-from config import is_admin, load_settings, update_settings
++from config import TIMEZONE, is_admin, load_settings, update_settings
  from scheduler import ensure_scheduler_started, schedule_all_reminders
+ 
+-BUTTON_SET_DATE = "📆 Изменить дату"
+ BUTTON_SET_TOPIC = "✏️ Изменить название"
+ BUTTON_SET_DESCRIPTION = "📝 Изменить описание"
++BUTTON_SET_DATE = "📆 Изменить дату"
+ BUTTON_SET_ZOOM = "🔗 Обновить Zoom"
+ BUTTON_SET_PAYMENT = "💳 Обновить оплату"
+ BUTTON_EXPORT = "📥 Список участников"
+ BUTTON_NOTIFY = "📢 Разослать напоминание"
+-BUTTON_SHOW_EVENT = "🗓 Просмотр текущего мероприятия"
++BUTTON_SHOW_EVENT = "👁 Текущее мероприятие"
++BUTTON_NEW_EVENT = "🆕 Новое мероприятие"
++BUTTON_CREATE_NEW_PROMPT = "🆕 Создать новое"
++BUTTON_CANCEL_ACTION = "Отмена"
  
  MENU_KEYBOARD = ReplyKeyboardMarkup(
      [
-         ["📆 Изменить дату", "📝 Изменить тему"],
-         ["🔗 Обновить Zoom", "💳 Обновить оплату"],
-         ["📥 Список участников", "📢 Разослать напоминание"],
-+        ["🗓 Просмотр текущего мероприятия"],
+-        [BUTTON_SET_DATE, BUTTON_SET_TOPIC],
+-        [BUTTON_SET_DESCRIPTION],
+-        [BUTTON_SET_ZOOM, BUTTON_SET_PAYMENT],
+-        [BUTTON_EXPORT, BUTTON_NOTIFY],
+-        [BUTTON_SHOW_EVENT],
++        [BUTTON_NEW_EVENT, BUTTON_SHOW_EVENT],
++        [BUTTON_SET_TOPIC, BUTTON_SET_DESCRIPTION],
++        [BUTTON_SET_DATE, BUTTON_SET_ZOOM],
++        [BUTTON_SET_PAYMENT, BUTTON_EXPORT],
++        [BUTTON_NOTIFY],
      ],
      resize_keyboard=True,
  )
  
- STATE_TOPIC, STATE_DATE, STATE_ZOOM, STATE_PAYMENT, STATE_NOTIFY = range(5)
+-STATE_TOPIC, STATE_DATE, STATE_ZOOM, STATE_PAYMENT, STATE_NOTIFY, STATE_DESCRIPTION = range(6)
++(
++    STATE_TOPIC,
++    STATE_DATE,
++    STATE_ZOOM,
++    STATE_PAYMENT,
++    STATE_NOTIFY,
++    STATE_DESCRIPTION,
++    STATE_DECIDE_NEW_EVENT,
++    STATE_NEW_EVENT_TITLE,
++    STATE_NEW_EVENT_DESCRIPTION,
++    STATE_NEW_EVENT_DATETIME,
++    STATE_NEW_EVENT_ZOOM,
++    STATE_NEW_EVENT_PAYMENT,
++) = range(12)
  
+ CANCEL_TEXT = "отмена"
+ CLEAR_TEXT = "очистить"
++SKIP_TEXT = "пропустить"
+ TOPIC_MAX_LENGTH = 200
++MAX_SLUG_LENGTH = 30
  
++TZ = ZoneInfo(TIMEZONE)
 +MISSING_VALUE = "❗️Не указано администратором"
-+_MONTH_NAMES = [
-+    "",
-+    "января",
-+    "февраля",
-+    "марта",
-+    "апреля",
-+    "мая",
-+    "июня",
-+    "июля",
-+    "августа",
-+    "сентября",
-+    "октября",
-+    "ноября",
-+    "декабря",
-+]
+ 
+-def _normalize_command_text(text: str | None) -> str:
 +
-+
- def _is_admin(update: Update) -> bool:
++def _normalize_command_text(text: Optional[str]) -> str:
+     return (text or "").strip().lower()
+ 
+ 
+-def _is_cancel(text: str | None) -> bool:
++def _is_cancel(text: Optional[str]) -> bool:
+     return _normalize_command_text(text) == CANCEL_TEXT
+ 
+ 
+-def _is_clear(text: str | None) -> bool:
++def _is_clear(text: Optional[str]) -> bool:
+     return _normalize_command_text(text) == CLEAR_TEXT
+ 
+ 
+-def _is_valid_url(value: str) -> bool:
+-    parsed = urlparse(value)
+-    return bool(parsed.scheme in {"http", "https"} and parsed.netloc)
++def _is_skip(text: Optional[str]) -> bool:
++    return _normalize_command_text(text) == SKIP_TEXT
+ 
+ 
+-MISSING_VALUE = "❗️Не указано администратором"
+-_MONTH_NAMES = [
+-    "",
+-    "января",
+-    "февраля",
+-    "марта",
+-    "апреля",
+-    "мая",
+-    "июня",
+-    "июля",
+-    "августа",
+-    "сентября",
+-    "октября",
+-    "ноября",
+-    "декабря",
+-]
+-
+-
+-def _is_admin(update: Update) -> bool:
++async def _ensure_admin(update: Update, *, message: str = "Недостаточно прав.") -> bool:
      user = update.effective_user
-     return bool(user and is_admin(chat_id=user.id, username=user.username))
+-    return bool(user and is_admin(chat_id=user.id, username=user.username))
++    if user and is_admin(chat_id=user.id, username=user.username):
++        return True
++    if update.message:
++        await update.message.reply_text(message)
++    else:
++        await update.effective_chat.send_message(message)
++    return False
  
  
-+def _format_value(value) -> str:
+-def _format_value(value) -> str:
+-    if value is None:
+-        return MISSING_VALUE
+-    if isinstance(value, str):
+-        stripped = value.strip()
+-        if not stripped:
+-            return MISSING_VALUE
+-        return stripped
+-    return str(value)
++def _slugify_topic(topic: str) -> str:
++    normalized = unidecode(topic or "").lower()
++    normalized = re.sub(r"[^a-z0-9]+", "-", normalized).strip("-")
++    if not normalized:
++        normalized = "event"
++    return normalized[:MAX_SLUG_LENGTH]
+ 
+ 
+-def _format_datetime(dt: datetime) -> str:
+-    if 1 <= dt.month <= 12:
+-        month = _MONTH_NAMES[dt.month]
+-    else:
+-        month = dt.strftime("%B")
+-    return f"{dt.day} {month} {dt.year}, {dt.strftime('%H:%M')}"
++def _generate_sheet_name(topic: str, event_dt: datetime) -> str:
++    base_slug = _slugify_topic(topic)
++    date_part = event_dt.strftime("%Y-%m-%d")
++    candidate = f"{date_part}__{base_slug}"
++    suffix = 1
++    while database.get_sheet_by_name(candidate) is not None:
++        suffix += 1
++        trimmed_slug = base_slug[: max(1, MAX_SLUG_LENGTH - len(f"-{suffix}"))]
++        candidate = f"{date_part}__{trimmed_slug}-{suffix}"
++    return candidate
+ 
+ 
+-def _try_parse_separate_datetime(date_str: str | None, time_str: str | None) -> datetime | None:
+-    if not date_str:
+-        return None
++def _generate_event_id() -> str:
++    return uuid4().hex[:12]
+ 
+-    date_str = date_str.strip()
+-    time_str = (time_str or "").strip()
+ 
+-    if time_str:
+-        candidate = f"{date_str} {time_str}".strip()
+-        for fmt in ("%Y-%m-%d %H:%M", "%d.%m.%Y %H:%M", "%d.%m.%y %H:%M"):
+-            try:
+-                return datetime.strptime(candidate, fmt)
+-            except ValueError:
+-                continue
+-    else:
+-        for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d.%m.%y"):
+-            try:
+-                return datetime.strptime(date_str, fmt)
+-            except ValueError:
+-                continue
+-    return None
++def _parse_datetime(text: str) -> datetime:
++    text = (text or "").strip()
++    formats = ["%d.%m.%Y %H:%M", "%d.%m %H:%M", "%Y-%m-%d %H:%M"]
++    for fmt in formats:
++        try:
++            dt = datetime.strptime(text, fmt)
++            if fmt == "%d.%m %H:%M":
++                dt = dt.replace(year=datetime.now(TZ).year)
++            return dt.replace(tzinfo=TZ)
++        except ValueError:
++            continue
++    raise ValueError("invalid format")
+ 
+ 
+-async def _ensure_admin(update: Update, *, message: str = "Недостаточно прав.") -> bool:
+-    if _is_admin(update):
+-        return True
+-    if update.message:
+-        await update.message.reply_text(message)
+-    else:
+-        await update.effective_chat.send_message(message)
+-    return False
++def _format_datetime(dt: Optional[datetime]) -> str:
++    if not dt:
++        return MISSING_VALUE
++    local_dt = dt.astimezone(TZ)
++    month_names = [
++        "",
++        "января",
++        "февраля",
++        "марта",
++        "апреля",
++        "мая",
++        "июня",
++        "июля",
++        "августа",
++        "сентября",
++        "октября",
++        "ноября",
++        "декабря",
++    ]
++    month_name = month_names[local_dt.month] if 1 <= local_dt.month <= 12 else local_dt.strftime("%B")
++    return f"{local_dt.day} {month_name} {local_dt.year}, {local_dt.strftime('%H:%M')}"
+ 
+ 
+-async def send_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+-    settings = load_settings()
+-    text = (
+-        "<b>Панель администратора</b>\n\n"
+-        f"Название: {_format_value(settings.get('topic'))}\n"
+-        f"Описание: {_format_value(settings.get('description'))}\n"
+-        f"Дата: {_format_value(settings.get('event_datetime'))}\n"
+-        f"Zoom: {_format_value(settings.get('zoom_link'))}\n"
+-        f"Оплата: {_format_value(settings.get('payment_link'))}"
+-    )
+-    if update.message:
+-        await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=MENU_KEYBOARD)
+-    else:
+-        await update.effective_chat.send_message(text, parse_mode=ParseMode.HTML, reply_markup=MENU_KEYBOARD)
++def _event_datetime(settings: Dict[str, object]) -> Optional[datetime]:
++    event_iso = settings.get("current_event_datetime")
++    if not event_iso:
++        return None
++    try:
++        return datetime.fromisoformat(str(event_iso))
++    except ValueError:
++        return None
+ 
+ 
+-async def show_current_event(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+-    if not await _ensure_admin(update):
+-        return ConversationHandler.END
++def _event_has_started(settings: Dict[str, object]) -> bool:
++    dt = _event_datetime(settings)
++    if not dt:
++        return False
++    now = datetime.now(TZ)
++    return now >= dt
+ 
+-    settings = load_settings()
+ 
++def _format_value(value: Optional[object]) -> str:
 +    if value is None:
 +        return MISSING_VALUE
 +    if isinstance(value, str):
 +        stripped = value.strip()
-+        if not stripped:
-+            return MISSING_VALUE
-+        return stripped
++        return stripped if stripped else MISSING_VALUE
 +    return str(value)
 +
 +
-+def _format_datetime(dt: datetime) -> str:
-+    if 1 <= dt.month <= 12:
-+        month = _MONTH_NAMES[dt.month]
++def _build_event_card(settings: Dict[str, object]) -> str:
+     topic = _format_value(settings.get("topic"))
+     description = _format_value(settings.get("description"))
+     zoom_link = _format_value(settings.get("zoom_link"))
+     payment_link = _format_value(settings.get("payment_link"))
+ 
+-    event_dt_text = MISSING_VALUE
+-    event_dt_obj: datetime | None = None
++    dt = _event_datetime(settings)
++    dt_text = _format_datetime(dt)
++
++    lines = ["<b>Текущее мероприятие</b>"]
++    lines.append(f"🎓 Название: {html.escape(topic)}")
++    lines.append(f"📝 Описание: {html.escape(description)}")
++    lines.append(f"📅 Дата и время: {html.escape(dt_text)}")
++    lines.append(f"🔗 Zoom: {html.escape(zoom_link)}")
++    lines.append(f"💳 Оплата: {html.escape(payment_link)}")
++    lines.append(f"🌍 Часовой пояс: {html.escape(TIMEZONE)}")
+ 
+-    event_iso = settings.get("event_datetime")
+-    if event_iso:
++    sheet_name = settings.get("current_event_sheet_name")
++    sheet_gid = settings.get("current_event_sheet_gid")
++    if sheet_name:
+         try:
+-            event_dt_obj = datetime.fromisoformat(event_iso)
+-            event_dt_text = _format_datetime(event_dt_obj)
+-        except ValueError:
+-            event_dt_text = event_iso
++            sheet_link = database.get_sheet_link(sheet_name, sheet_gid)
++            lines.append(f"📊 Участники: <a href=\"{sheet_link}\">Открыть лист</a>")
++        except RuntimeError:
++            lines.append("📊 Участники: лист не настроен")
+     else:
+-        event_date = settings.get("event_date")
+-        event_time = settings.get("event_time")
+-        combined = " ".join(
+-            part.strip()
+-            for part in (event_date or "", event_time or "")
+-            if part and part.strip()
++        lines.append("📊 Участники: лист не настроен")
++
++    if _event_has_started(settings):
++        lines.append("\n⚠️ Мероприятие уже началось. Изменения невозможны.")
++
++    return "\n".join(lines)
++
++
++async def _send_event_card(update: Update, settings: Optional[Dict[str, object]] = None) -> None:
++    if settings is None:
++        settings = load_settings()
++    text = _build_event_card(settings)
++    if update.message:
++        await update.message.reply_text(
++            text,
++            parse_mode=ParseMode.HTML,
++            reply_markup=MENU_KEYBOARD,
++            disable_web_page_preview=True,
++        )
 +    else:
-+        month = dt.strftime("%B")
-+    return f"{dt.day} {month} {dt.year}, {dt.strftime('%H:%M')}"
++        await update.effective_chat.send_message(
++            text,
++            parse_mode=ParseMode.HTML,
++            reply_markup=MENU_KEYBOARD,
++            disable_web_page_preview=True,
+         )
+-        if combined:
+-            event_dt_text = combined
+-            event_dt_obj = _try_parse_separate_datetime(event_date, event_time)
+-
+-    lines = [
+-        f"🎓 Название: {topic}",
+-        f"📝 Описание: {description}",
+-        f"📅 Дата и время: {event_dt_text if event_dt_text.strip() else MISSING_VALUE}",
+-        f"🔗 Zoom: {zoom_link}",
+-        f"💳 Ссылка на оплату: {payment_link}",
+-    ]
+ 
+-    if "timezone" in settings:
+-        timezone_value = _format_value(settings.get("timezone"))
+-        lines.append(f"🌍 Часовой пояс: {timezone_value}")
+-
+-    known_fields = {
+-        "topic",
+-        "description",
+-        "event_datetime",
+-        "event_date",
+-        "event_time",
+-        "zoom_link",
+-        "payment_link",
+-        "timezone",
+-    }
+-    for key in sorted(settings):
+-        if key in known_fields:
+-            continue
+-        value_text = _format_value(settings.get(key))
+-        label = key.replace("_", " ").capitalize()
+-        lines.append(f"• {label}: {value_text}")
+ 
+-    message = "\n".join(lines)
++async def send_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
++    await _send_event_card(update)
 +
 +
-+def _try_parse_separate_datetime(date_str: str | None, time_str: str | None) -> datetime | None:
-+    if not date_str:
++async def _maybe_require_new_event(update: Update) -> Optional[Dict[str, object]]:
++    settings = load_settings()
++    if not settings.get("current_event_id") or not settings.get("current_event_sheet_name"):
++        await _prompt_new_event_creation(update, started=False)
 +        return None
-+
-+    date_str = date_str.strip()
-+    time_str = (time_str or "").strip()
-+
-+    if time_str:
-+        candidate = f"{date_str} {time_str}".strip()
-+        for fmt in ("%Y-%m-%d %H:%M", "%d.%m.%Y %H:%M", "%d.%m.%y %H:%M"):
-+            try:
-+                return datetime.strptime(candidate, fmt)
-+            except ValueError:
-+                continue
++    if _event_has_started(settings):
++        await _prompt_new_event_creation(update, started=True)
++        return None
++    return settings
+ 
+-    if event_dt_obj and event_dt_obj < datetime.now(event_dt_obj.tzinfo):
+-        message += "\n\n⚠️ Мероприятие уже прошло."
+ 
++async def _prompt_new_event_creation(update: Update, *, started: bool) -> None:
++    keyboard = ReplyKeyboardMarkup(
++        [[BUTTON_CREATE_NEW_PROMPT], [BUTTON_CANCEL_ACTION]], resize_keyboard=True
++    )
++    if started:
++        message = (
++            "Текущее мероприятие уже началось. Для изменений создайте новое мероприятие."
++        )
 +    else:
-+        for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d.%m.%y"):
-+            try:
-+                return datetime.strptime(date_str, fmt)
-+            except ValueError:
-+                continue
-+    return None
-+
-+
- async def _ensure_admin(update: Update, *, message: str = "Недостаточно прав.") -> bool:
-     if _is_admin(update):
-         return True
++        message = "Активное мероприятие не настроено. Создайте новое мероприятие."
      if update.message:
-         await update.message.reply_text(message)
+-        await update.message.reply_text(message, reply_markup=MENU_KEYBOARD)
++        await update.message.reply_text(message, reply_markup=keyboard)
      else:
-         await update.effective_chat.send_message(message)
-     return False
+-        await update.effective_chat.send_message(message, reply_markup=MENU_KEYBOARD)
++        await update.effective_chat.send_message(message, reply_markup=keyboard)
  
- 
- async def send_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-     settings = load_settings()
-     text = (
-         "<b>Панель администратора</b>\n\n"
-         f"Тема: {settings.get('topic')}\n"
-         f"Описание: {settings.get('description')}\n"
-         f"Дата: {settings.get('event_datetime') or 'не задана'}\n"
-         f"Zoom: {settings.get('zoom_link') or 'не задан'}\n"
-         f"Оплата: {settings.get('payment_link') or 'не задана'}"
-     )
-     if update.message:
-         await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=MENU_KEYBOARD)
-     else:
-         await update.effective_chat.send_message(text, parse_mode=ParseMode.HTML, reply_markup=MENU_KEYBOARD)
- 
- 
++
 +async def show_current_event(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 +    if not await _ensure_admin(update):
 +        return ConversationHandler.END
-+
-+    settings = load_settings()
-+
-+    topic = _format_value(settings.get("topic"))
-+    description = _format_value(settings.get("description"))
-+    zoom_link = _format_value(settings.get("zoom_link"))
-+    payment_link = _format_value(settings.get("payment_link"))
-+
-+    event_dt_text = MISSING_VALUE
-+    event_dt_obj: datetime | None = None
-+
-+    event_iso = settings.get("event_datetime")
-+    if event_iso:
-+        try:
-+            event_dt_obj = datetime.fromisoformat(event_iso)
-+            event_dt_text = _format_datetime(event_dt_obj)
-+        except ValueError:
-+            event_dt_text = event_iso
-+    else:
-+        event_date = settings.get("event_date")
-+        event_time = settings.get("event_time")
-+        combined = " ".join(
-+            part.strip()
-+            for part in (event_date or "", event_time or "")
-+            if part and part.strip()
-+        )
-+        if combined:
-+            event_dt_text = combined
-+            event_dt_obj = _try_parse_separate_datetime(event_date, event_time)
-+
-+    lines = [
-+        f"🎓 Название: {topic}",
-+        f"📝 Описание: {description}",
-+        f"📅 Дата и время: {event_dt_text if event_dt_text.strip() else MISSING_VALUE}",
-+        f"🔗 Zoom: {zoom_link}",
-+        f"💳 Ссылка на оплату: {payment_link}",
-+    ]
-+
-+    if "timezone" in settings:
-+        timezone_value = _format_value(settings.get("timezone"))
-+        lines.append(f"🌍 Часовой пояс: {timezone_value}")
-+
-+    known_fields = {
-+        "topic",
-+        "description",
-+        "event_datetime",
-+        "event_date",
-+        "event_time",
-+        "zoom_link",
-+        "payment_link",
-+        "timezone",
-+    }
-+    for key in sorted(settings):
-+        if key in known_fields:
-+            continue
-+        value_text = _format_value(settings.get(key))
-+        label = key.replace("_", " ").capitalize()
-+        lines.append(f"• {label}: {value_text}")
-+
-+    message = "\n".join(lines)
-+
-+    if event_dt_obj and event_dt_obj < datetime.now(event_dt_obj.tzinfo):
-+        message += "\n\n⚠️ Мероприятие уже прошло."
-+
-+    if update.message:
-+        await update.message.reply_text(message, reply_markup=MENU_KEYBOARD)
-+    else:
-+        await update.effective_chat.send_message(message, reply_markup=MENU_KEYBOARD)
-+
-+    return ConversationHandler.END
-+
-+
++    await _send_event_card(update)
+     return ConversationHandler.END
+ 
+ 
  async def admin_command_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
      if not await _ensure_admin(update, message="Эта команда доступна только администратору."):
          return ConversationHandler.END
@@ -212,9 +442,13 @@ index 3ba29db6d581b89a3d445adc0d67c46b229827b8..79a81bc2f1db38f6aaeb78d13a4a643c
  async def set_topic_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
      if not await _ensure_admin(update):
          return ConversationHandler.END
++    settings = await _maybe_require_new_event(update)
++    if settings is None:
++        return STATE_DECIDE_NEW_EVENT
      await update.message.reply_text(
-         "Введите новую тему и описание через символ \"|\".\n"
-         "Например: Мой вебинар | Погружение в психологию",
+-        "Введите новое название мероприятия (до 200 символов).\n"
+-        "Доступные команды: Отмена.",
++        "Введите новое название мероприятия (до 200 символов).\nДоступные команды: Отмена.",
          reply_markup=ReplyKeyboardRemove(),
      )
      return STATE_TOPIC
@@ -223,11 +457,255 @@ index 3ba29db6d581b89a3d445adc0d67c46b229827b8..79a81bc2f1db38f6aaeb78d13a4a643c
  async def set_topic_finish(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
      if not await _ensure_admin(update):
          return ConversationHandler.END
-     payload = (update.message.text or "").split("|", maxsplit=1)
-     topic = payload[0].strip() if payload else ""
-     description = payload[1].strip() if len(payload) > 1 else ""
-     update_settings(topic=topic or None, description=description or None)
-@@ -181,42 +317,44 @@ async def notify_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
+     text = (update.message.text or "").strip()
+-
+     if _is_cancel(text):
+         await update.message.reply_text("Изменение названия отменено.", reply_markup=MENU_KEYBOARD)
+         return ConversationHandler.END
+-
+     if not text:
+         await update.message.reply_text("Название не может быть пустым. Попробуйте снова.")
+         return STATE_TOPIC
+-
+     if len(text) > TOPIC_MAX_LENGTH:
+         await update.message.reply_text(
+             f"Название слишком длинное. Максимум {TOPIC_MAX_LENGTH} символов."
+         )
+         return STATE_TOPIC
+-
+-    update_settings(topic=text)
+-    await show_current_event(update, context)
++    settings = update_settings(topic=text)
+     await update.message.reply_text("✅ Название обновлено.", reply_markup=MENU_KEYBOARD)
++    await _send_event_card(update, settings)
+     return ConversationHandler.END
+ 
+ 
+ async def set_description_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+     if not await _ensure_admin(update):
+         return ConversationHandler.END
++    settings = await _maybe_require_new_event(update)
++    if settings is None:
++        return STATE_DECIDE_NEW_EVENT
+     await update.message.reply_text(
+-        "Отправьте новое описание мероприятия.\n"
+-        "Доступные команды: Отмена, Очистить.",
++        "Отправьте новое описание мероприятия.\nДоступные команды: Отмена, Очистить.",
+         reply_markup=ReplyKeyboardRemove(),
+     )
+     return STATE_DESCRIPTION
+ 
+ 
+ async def set_description_finish(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+     if not await _ensure_admin(update):
+         return ConversationHandler.END
+-
+     raw_text = update.message.text or ""
+     if _is_cancel(raw_text):
+         await update.message.reply_text("Изменение описания отменено.", reply_markup=MENU_KEYBOARD)
+         return ConversationHandler.END
+-
+     if _is_clear(raw_text):
+-        update_settings(description=None)
+-        await show_current_event(update, context)
++        settings = update_settings(description="")
+         await update.message.reply_text("Описание очищено.", reply_markup=MENU_KEYBOARD)
++        await _send_event_card(update, settings)
+         return ConversationHandler.END
+-
+     stripped = raw_text.strip()
+     if not stripped:
+         await update.message.reply_text(
+             "Описание не может быть пустым. Введите текст или используйте Очистить."
+         )
+         return STATE_DESCRIPTION
+-
+-    update_settings(description=stripped)
+-    await show_current_event(update, context)
++    settings = update_settings(description=stripped)
+     await update.message.reply_text("✅ Описание обновлено.", reply_markup=MENU_KEYBOARD)
++    await _send_event_card(update, settings)
+     return ConversationHandler.END
+ 
+ 
+-def _parse_datetime(text: str) -> datetime:
+-    text = text.strip()
+-    formats = ["%d.%m.%Y %H:%M", "%d.%m %H:%M"]
+-    for fmt in formats:
+-        try:
+-            dt = datetime.strptime(text, fmt)
+-            if fmt == "%d.%m %H:%M":
+-                dt = dt.replace(year=datetime.now().year)
+-            return dt
+-        except ValueError:
+-            continue
+-    raise ValueError("invalid format")
+-
+-
+ async def set_date_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+     if not await _ensure_admin(update):
+         return ConversationHandler.END
++    settings = await _maybe_require_new_event(update)
++    if settings is None:
++        return STATE_DECIDE_NEW_EVENT
+     await update.message.reply_text(
+-        "Введите дату и время в формате ДД.ММ.ГГГГ ЧЧ:ММ или ДД.ММ ЧЧ:ММ",
++        "Введите дату и время в формате ДД.ММ.ГГГГ ЧЧ:ММ или ДД.ММ ЧЧ:ММ.",
+         reply_markup=ReplyKeyboardRemove(),
+     )
+     return STATE_DATE
+ 
+ 
+ async def set_date_finish(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+     if not await _ensure_admin(update):
+         return ConversationHandler.END
+     text = update.message.text or ""
+     try:
+         event_dt = _parse_datetime(text)
+     except ValueError:
+         await update.message.reply_text("Не удалось распознать дату. Попробуйте снова.")
+         return STATE_DATE
+-
+-    update_settings(event_datetime=event_dt.isoformat())
++    settings = update_settings(current_event_datetime=event_dt.isoformat())
+     ensure_scheduler_started()
+     schedule_all_reminders(context.application)
+-    await show_current_event(update, context)
+     await update.message.reply_text("Дата вебинара обновлена.", reply_markup=MENU_KEYBOARD)
++    await _send_event_card(update, settings)
+     return ConversationHandler.END
+ 
+ 
++def _is_valid_url(value: str) -> bool:
++    pattern = re.compile(r"^https?://.+$", re.IGNORECASE)
++    return bool(pattern.match(value))
++
++
+ async def set_zoom_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+     if not await _ensure_admin(update):
+         return ConversationHandler.END
++    settings = await _maybe_require_new_event(update)
++    if settings is None:
++        return STATE_DECIDE_NEW_EVENT
+     await update.message.reply_text(
+         "Отправьте новую Zoom-ссылку.\nДоступные команды: Отмена, Очистить.",
+         reply_markup=ReplyKeyboardRemove(),
+     )
+     return STATE_ZOOM
+ 
+ 
+ async def set_zoom_finish(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+     if not await _ensure_admin(update):
+         return ConversationHandler.END
+     text = update.message.text or ""
+-
+     if _is_cancel(text):
+         await update.message.reply_text("Обновление Zoom-ссылки отменено.", reply_markup=MENU_KEYBOARD)
+         return ConversationHandler.END
+-
+-    if _is_clear(text):
+-        update_settings(zoom_link=None)
+-        await show_current_event(update, context)
++    if _is_clear(text) or _is_skip(text):
++        settings = update_settings(zoom_link="")
+         await update.message.reply_text("Ссылка Zoom очищена.", reply_markup=MENU_KEYBOARD)
++        await _send_event_card(update, settings)
+         schedule_all_reminders(context.application)
+         return ConversationHandler.END
+-
+     link = text.strip()
+-    if not link or not _is_valid_url(link):
++    if not _is_valid_url(link):
+         await update.message.reply_text(
+-            "Укажите корректную ссылку (http/https) или используйте команды Отмена/Очистить."
++            "Укажите корректную ссылку (http/https) или используйте команды Отмена/Очистить/Пропустить."
+         )
+         return STATE_ZOOM
+-
+-    update_settings(zoom_link=link)
+-    await show_current_event(update, context)
++    settings = update_settings(zoom_link=link)
+     await update.message.reply_text("Ссылка Zoom обновлена.", reply_markup=MENU_KEYBOARD)
++    await _send_event_card(update, settings)
+     schedule_all_reminders(context.application)
+     return ConversationHandler.END
+ 
+ 
+ async def set_payment_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+     if not await _ensure_admin(update):
+         return ConversationHandler.END
++    settings = await _maybe_require_new_event(update)
++    if settings is None:
++        return STATE_DECIDE_NEW_EVENT
+     await update.message.reply_text(
+-        "Отправьте ссылку на оплату (http/https).\nДоступные команды: Отмена, Очистить.",
++        "Отправьте ссылку на оплату (http/https).\nДоступные команды: Отмена, Очистить, Пропустить.",
+         reply_markup=ReplyKeyboardRemove(),
+     )
+     return STATE_PAYMENT
+ 
+ 
+ async def set_payment_finish(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+     if not await _ensure_admin(update):
+         return ConversationHandler.END
+     text = update.message.text or ""
+-
+     if _is_cancel(text):
+         await update.message.reply_text("Обновление ссылки на оплату отменено.", reply_markup=MENU_KEYBOARD)
+         return ConversationHandler.END
+-
+-    if _is_clear(text):
+-        update_settings(payment_link=None)
+-        await show_current_event(update, context)
++    if _is_clear(text) or _is_skip(text):
++        settings = update_settings(payment_link="")
+         await update.message.reply_text("Ссылка на оплату очищена.", reply_markup=MENU_KEYBOARD)
++        await _send_event_card(update, settings)
+         return ConversationHandler.END
+-
+     link = text.strip()
+-    if not link or not _is_valid_url(link):
++    if not _is_valid_url(link):
+         await update.message.reply_text(
+-            "Укажите корректную ссылку (http/https) или используйте команды Отмена/Очистить."
++            "Укажите корректную ссылку (http/https) или используйте команды Отмена/Очистить/Пропустить."
+         )
+         return STATE_PAYMENT
+-
+-    update_settings(payment_link=link)
+-    await show_current_event(update, context)
++    settings = update_settings(payment_link=link)
+     await update.message.reply_text("Ссылка на оплату обновлена.", reply_markup=MENU_KEYBOARD)
++    await _send_event_card(update, settings)
+     return ConversationHandler.END
+ 
+ 
+ async def export_participants(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+     if not await _ensure_admin(update):
+         return ConversationHandler.END
++    try:
++        sheet_link = database.get_sheet_link()
++    except RuntimeError:
++        await update.message.reply_text(
++            "Активный лист не найден. Сначала создайте новое мероприятие.",
++            reply_markup=MENU_KEYBOARD,
++        )
++        return ConversationHandler.END
++    await update.message.reply_text(
++        f"📊 Список участников: {sheet_link}", reply_markup=MENU_KEYBOARD, disable_web_page_preview=True
++    )
+     path = database.export_database()
+-    await update.message.reply_document(document=path.read_bytes(), filename=Path(path).name)
++    await update.message.reply_document(document=path.read_bytes(), filename=path.name)
+     return ConversationHandler.END
+ 
+ 
+ async def notify_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+     if not await _ensure_admin(update):
+         return ConversationHandler.END
+     await update.message.reply_text(
+         "Введите текст напоминания, который будет отправлен всем участникам:",
+         reply_markup=ReplyKeyboardRemove(),
      )
      return STATE_NOTIFY
  
@@ -243,6 +721,173 @@ index 3ba29db6d581b89a3d445adc0d67c46b229827b8..79a81bc2f1db38f6aaeb78d13a4a643c
      return ConversationHandler.END
  
  
++async def start_new_event_flow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
++    if not await _ensure_admin(update):
++        return ConversationHandler.END
++    context.user_data["new_event_data"] = {}
++    await update.message.reply_text(
++        "Введите название нового мероприятия.", reply_markup=ReplyKeyboardRemove()
++    )
++    return STATE_NEW_EVENT_TITLE
++
++
++async def handle_new_event_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
++    if not await _ensure_admin(update):
++        return ConversationHandler.END
++    text = (update.message.text or "").strip()
++    if text == BUTTON_CREATE_NEW_PROMPT or text == BUTTON_NEW_EVENT:
++        return await start_new_event_flow(update, context)
++    await update.message.reply_text("Создание нового мероприятия отменено.", reply_markup=MENU_KEYBOARD)
++    return ConversationHandler.END
++
++
++async def new_event_title(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
++    if not await _ensure_admin(update):
++        return ConversationHandler.END
++    text = (update.message.text or "").strip()
++    if _is_cancel(text):
++        await update.message.reply_text("Создание мероприятия отменено.", reply_markup=MENU_KEYBOARD)
++        context.user_data.pop("new_event_data", None)
++        return ConversationHandler.END
++    if not text:
++        await update.message.reply_text("Название не может быть пустым. Попробуйте снова.")
++        return STATE_NEW_EVENT_TITLE
++    context.user_data.setdefault("new_event_data", {})["topic"] = text
++    await update.message.reply_text(
++        "Отправьте описание мероприятия.\nДоступные команды: Отмена, Пропустить.",
++        reply_markup=ReplyKeyboardRemove(),
++    )
++    return STATE_NEW_EVENT_DESCRIPTION
++
++
++async def new_event_description(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
++    if not await _ensure_admin(update):
++        return ConversationHandler.END
++    text = update.message.text or ""
++    data = context.user_data.setdefault("new_event_data", {})
++    if _is_cancel(text):
++        await update.message.reply_text("Создание мероприятия отменено.", reply_markup=MENU_KEYBOARD)
++        context.user_data.pop("new_event_data", None)
++        return ConversationHandler.END
++    if _is_skip(text):
++        data["description"] = ""
++    else:
++        data["description"] = text.strip()
++    await update.message.reply_text(
++        "Введите дату и время в формате ДД.ММ.ГГГГ ЧЧ:ММ или ДД.ММ ЧЧ:ММ.",
++        reply_markup=ReplyKeyboardRemove(),
++    )
++    return STATE_NEW_EVENT_DATETIME
++
++
++async def new_event_datetime(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
++    if not await _ensure_admin(update):
++        return ConversationHandler.END
++    text = update.message.text or ""
++    try:
++        event_dt = _parse_datetime(text)
++    except ValueError:
++        await update.message.reply_text("Не удалось распознать дату. Попробуйте снова.")
++        return STATE_NEW_EVENT_DATETIME
++    context.user_data.setdefault("new_event_data", {})["datetime"] = event_dt
++    await update.message.reply_text(
++        "Укажите Zoom-ссылку. Доступные команды: Отмена, Пропустить.",
++        reply_markup=ReplyKeyboardRemove(),
++    )
++    return STATE_NEW_EVENT_ZOOM
++
++
++async def new_event_zoom(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
++    if not await _ensure_admin(update):
++        return ConversationHandler.END
++    text = update.message.text or ""
++    data = context.user_data.setdefault("new_event_data", {})
++    if _is_cancel(text):
++        await update.message.reply_text("Создание мероприятия отменено.", reply_markup=MENU_KEYBOARD)
++        context.user_data.pop("new_event_data", None)
++        return ConversationHandler.END
++    if _is_skip(text) or _is_clear(text):
++        data["zoom_link"] = ""
++    else:
++        link = text.strip()
++        if not _is_valid_url(link):
++            await update.message.reply_text(
++                "Укажите корректную ссылку (http/https) или используйте команды Отмена/Пропустить."
++            )
++            return STATE_NEW_EVENT_ZOOM
++        data["zoom_link"] = link
++    await update.message.reply_text(
++        "Укажите ссылку на оплату. Доступные команды: Отмена, Пропустить.",
++        reply_markup=ReplyKeyboardRemove(),
++    )
++    return STATE_NEW_EVENT_PAYMENT
++
++
++async def _finalize_new_event(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
++    data = context.user_data.get("new_event_data") or {}
++    topic = data.get("topic")
++    event_dt: Optional[datetime] = data.get("datetime")
++    if not topic or not event_dt:
++        await update.message.reply_text(
++            "Недостаточно данных для создания мероприятия. Попробуйте снова.",
++            reply_markup=MENU_KEYBOARD,
++        )
++        context.user_data.pop("new_event_data", None)
++        return ConversationHandler.END
++
++    sheet_name = _generate_sheet_name(topic, event_dt)
++    worksheet = database.get_or_create_sheet(sheet_name)
++    event_id = _generate_event_id()
++
++    settings = update_settings(
++        topic=topic,
++        description=data.get("description", ""),
++        zoom_link=data.get("zoom_link", ""),
++        payment_link=data.get("payment_link", ""),
++        current_event_id=event_id,
++        current_event_sheet_name=worksheet.title,
++        current_event_sheet_gid=worksheet.id,
++        current_event_datetime=event_dt.isoformat(),
++        timezone=TIMEZONE,
++    )
++
++    context.user_data.pop("new_event_data", None)
++    ensure_scheduler_started()
++    schedule_all_reminders(context.application)
++
++    sheet_link = database.get_sheet_link(worksheet.title, worksheet.id)
++    await update.message.reply_text(
++        "Новое мероприятие создано ✅\n"
++        f"Лист участников: {sheet_link}",
++        disable_web_page_preview=True,
++        reply_markup=MENU_KEYBOARD,
++    )
++    await _send_event_card(update, settings)
++    return ConversationHandler.END
++
++
++async def new_event_payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
++    if not await _ensure_admin(update):
++        return ConversationHandler.END
++    text = update.message.text or ""
++    data = context.user_data.setdefault("new_event_data", {})
++    if _is_cancel(text):
++        await update.message.reply_text("Создание мероприятия отменено.", reply_markup=MENU_KEYBOARD)
++        context.user_data.pop("new_event_data", None)
++        return ConversationHandler.END
++    if _is_skip(text) or _is_clear(text):
++        data["payment_link"] = ""
++    else:
++        link = text.strip()
++        if not _is_valid_url(link):
++            await update.message.reply_text(
++                "Укажите корректную ссылку (http/https) или используйте команды Отмена/Пропустить."
++            )
++            return STATE_NEW_EVENT_PAYMENT
++        data["payment_link"] = link
++    return await _finalize_new_event(update, context)
++
++
  def build_admin_conversation() -> ConversationHandler:
      return ConversationHandler(
          entry_points=[
@@ -253,23 +898,716 @@ index 3ba29db6d581b89a3d445adc0d67c46b229827b8..79a81bc2f1db38f6aaeb78d13a4a643c
              CommandHandler("set_payment", set_payment_start),
              CommandHandler("export", export_participants),
              CommandHandler("notify", notify_start),
-+            CommandHandler("current_event", show_current_event),
-             MessageHandler(filters.Regex("^📝"), set_topic_start),
-             MessageHandler(filters.Regex("^📆"), set_date_start),
-             MessageHandler(filters.Regex("^🔗"), set_zoom_start),
-             MessageHandler(filters.Regex("^💳"), set_payment_start),
-             MessageHandler(filters.Regex("^📥"), export_participants),
-             MessageHandler(filters.Regex("^📢"), notify_start),
-+            MessageHandler(filters.Regex("^🗓"), show_current_event),
+             CommandHandler("current_event", show_current_event),
+-            MessageHandler(filters.Regex("^✏️"), set_topic_start),
+-            MessageHandler(filters.Regex("^📝 Изменить описание$"), set_description_start),
+-            MessageHandler(filters.Regex("^📆"), set_date_start),
+-            MessageHandler(filters.Regex("^🔗"), set_zoom_start),
+-            MessageHandler(filters.Regex("^💳"), set_payment_start),
+-            MessageHandler(filters.Regex("^📥"), export_participants),
+-            MessageHandler(filters.Regex("^📢"), notify_start),
+-            MessageHandler(filters.Regex("^🗓"), show_current_event),
++            CommandHandler("new_event", start_new_event_flow),
++            MessageHandler(filters.Regex(f"^{re.escape(BUTTON_SET_TOPIC)}$"), set_topic_start),
++            MessageHandler(filters.Regex(f"^{re.escape(BUTTON_SET_DESCRIPTION)}$"), set_description_start),
++            MessageHandler(filters.Regex(f"^{re.escape(BUTTON_SET_DATE)}$"), set_date_start),
++            MessageHandler(filters.Regex(f"^{re.escape(BUTTON_SET_ZOOM)}$"), set_zoom_start),
++            MessageHandler(filters.Regex(f"^{re.escape(BUTTON_SET_PAYMENT)}$"), set_payment_start),
++            MessageHandler(filters.Regex(f"^{re.escape(BUTTON_EXPORT)}$"), export_participants),
++            MessageHandler(filters.Regex(f"^{re.escape(BUTTON_NOTIFY)}$"), notify_start),
++            MessageHandler(filters.Regex(f"^{re.escape(BUTTON_SHOW_EVENT)}$"), show_current_event),
++            MessageHandler(filters.Regex(f"^{re.escape(BUTTON_NEW_EVENT)}$"), start_new_event_flow),
          ],
          states={
              STATE_TOPIC: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_topic_finish)],
++            STATE_DESCRIPTION: [
++                MessageHandler(filters.TEXT & ~filters.COMMAND, set_description_finish)
++            ],
              STATE_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_date_finish)],
              STATE_ZOOM: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_zoom_finish)],
              STATE_PAYMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_payment_finish)],
              STATE_NOTIFY: [MessageHandler(filters.TEXT & ~filters.COMMAND, notify_finish)],
+-            STATE_DESCRIPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_description_finish)],
++            STATE_DECIDE_NEW_EVENT: [
++                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_new_event_decision)
++            ],
++            STATE_NEW_EVENT_TITLE: [
++                MessageHandler(filters.TEXT & ~filters.COMMAND, new_event_title)
++            ],
++            STATE_NEW_EVENT_DESCRIPTION: [
++                MessageHandler(filters.TEXT & ~filters.COMMAND, new_event_description)
++            ],
++            STATE_NEW_EVENT_DATETIME: [
++                MessageHandler(filters.TEXT & ~filters.COMMAND, new_event_datetime)
++            ],
++            STATE_NEW_EVENT_ZOOM: [
++                MessageHandler(filters.TEXT & ~filters.COMMAND, new_event_zoom)
++            ],
++            STATE_NEW_EVENT_PAYMENT: [
++                MessageHandler(filters.TEXT & ~filters.COMMAND, new_event_payment)
++            ],
          },
          fallbacks=[CommandHandler("cancel", admin_command_entry)],
          allow_reentry=True,
      )
++
+diff --git a/config.py b/config.py
+index 07e9bf3349e40d24c4350993de4641ad9bc99333..787e3634820c56eac2660098d72df003cb75a797 100644
+--- a/config.py
++++ b/config.py
+@@ -9,53 +9,57 @@ from typing import Any, Dict, Optional, Tuple
+ BOT_TOKEN: str = "8439661494:AAG5nqW5raGjVjocSX6L8oCS1hZngqdq-Uo"
+ 
+ # Administrators who can access privileged commands.
+ ADMINS: Tuple[Dict[str, Any], ...] = (
+     {
+         "chat_id": 7740254761,
+         "username": "z_ivan89",
+     },
+ )
+ 
+ 
+ # === Google Sheets Integration ===
+ GSPREAD_CREDENTIALS_PATH = "./service_account.json"
+ GSPREAD_SHEET_ID = "1f5bRTFlKQ3FD-u0cggKj-87HdXNzMwz_H8imefFaNmI"
+ TIMEZONE = "Europe/Moscow"
+ 
+ 
+ 
+ # Storage locations
+ DATA_DIR = Path("data")
+ SETTINGS_FILE = DATA_DIR / "config.json"
+ 
+ _DEFAULT_SETTINGS: Dict[str, Any] = {
+     "topic": "Психологический вебинар",
+     "description": "Авторский вебинар по психологии",
+-    "event_datetime": None,  # ISO formatted date time string
++    "current_event_id": None,
++    "current_event_sheet_name": None,
++    "current_event_sheet_gid": None,
++    "current_event_datetime": None,  # ISO formatted date time string in TIMEZONE
+     "zoom_link": "",
+     "payment_link": "",
++    "timezone": TIMEZONE,
+ }
+ 
+ 
+ def is_admin(chat_id: Optional[int] = None, username: Optional[str] = None) -> bool:
+     """Return True if provided identifiers match a known administrator."""
+ 
+     normalized_username = (username or "").lstrip("@").lower()
+     for admin in ADMINS:
+         admin_chat_id = admin.get("chat_id")
+         admin_username = (admin.get("username") or "").lstrip("@").lower()
+ 
+         if chat_id is not None and admin_chat_id == chat_id:
+             return True
+         if normalized_username and admin_username and normalized_username == admin_username:
+             return True
+     return False
+ 
+ 
+ def ensure_data_dir() -> None:
+     """Ensure that all required folders exist."""
+     DATA_DIR.mkdir(parents=True, exist_ok=True)
+ 
+ 
+ def load_settings() -> Dict[str, Any]:
+     """Load the admin editable settings from disk."""
+diff --git a/database.py b/database.py
+index f8d3b37f2bcb569794b0bbfd13d23616dcc5a219..e09be64cbea423fb9b01f64573b0ca90c65a6fb2 100644
+--- a/database.py
++++ b/database.py
+@@ -1,120 +1,239 @@
+-"""Simple Excel backed storage for webinar participants."""
++"""Google Sheets backed storage for webinar participants."""
+ from __future__ import annotations
+ 
+ from dataclasses import dataclass
++from datetime import datetime
+ from pathlib import Path
+ from typing import List, Optional
+ 
++import gspread
+ import pandas as pd
+-
+-from config import DATA_DIR
+-
+-DATABASE_PATH = DATA_DIR / "participants.xlsx"
+-COLUMNS = [
+-    "Имя",
+-    "Username",
+-    "ChatID",
+-    "Email",
+-    "Формат",
+-    "Оплата",
+-    "Фидбэк",
++from google.oauth2.service_account import Credentials
++from zoneinfo import ZoneInfo
++
++from config import (
++    DATA_DIR,
++    GSPREAD_CREDENTIALS_PATH,
++    GSPREAD_SHEET_ID,
++    TIMEZONE,
++    load_settings,
++)
++
++
++SCOPES = (
++    "https://www.googleapis.com/auth/spreadsheets",
++    "https://www.googleapis.com/auth/drive.file",
++)
++
++HEADERS = [
++    "timestamp",
++    "chat_id",
++    "username",
++    "name",
++    "email",
++    "role",
++    "paid",
++    "feedback",
+ ]
+ 
++TZ = ZoneInfo(TIMEZONE)
++
++_client: gspread.Client | None = None
++
+ 
+ @dataclass
+ class Participant:
+     name: str
+     username: str
+     chat_id: int
+     email: str
+-    participation_type: str = "free"
+-    payment_status: str = "нет"
++    role: str = "free"
++    paid: str = "no"
+     feedback: str = ""
+ 
+ 
+-def _load_dataframe() -> pd.DataFrame:
+-    if not DATABASE_PATH.exists():
+-        ensure_database()
+-    return pd.read_excel(DATABASE_PATH)
++def _get_client() -> gspread.Client:
++    global _client
++    if _client is None:
++        credentials = Credentials.from_service_account_file(
++            GSPREAD_CREDENTIALS_PATH, scopes=SCOPES
++        )
++        _client = gspread.authorize(credentials)
++    return _client
++
+ 
++def _open_spreadsheet() -> gspread.Spreadsheet:
++    client = _get_client()
++    return client.open_by_key(GSPREAD_SHEET_ID)
+ 
+-def ensure_database() -> None:
+-    """Create an empty database file if missing."""
+-    DATA_DIR.mkdir(parents=True, exist_ok=True)
+-    if DATABASE_PATH.exists():
++
++def _ensure_headers(worksheet: gspread.Worksheet) -> None:
++    current_headers = worksheet.row_values(1)
++    if [h.strip() for h in current_headers] == HEADERS:
+         return
+-    empty = pd.DataFrame(columns=COLUMNS)
+-    empty.to_excel(DATABASE_PATH, index=False)
+-
+-
+-def add_or_update_participant(participant: Participant) -> None:
+-    df = _load_dataframe()
+-    mask = df["ChatID"] == participant.chat_id
+-    if mask.any():
+-        df.loc[mask, ["Имя", "Username", "Email"]] = [
+-            participant.name,
+-            participant.username,
+-            participant.email,
+-        ]
++    worksheet.update("1:1", [HEADERS])
++
++
++def create_event_sheet(sheet_name: str) -> gspread.Worksheet:
++    spreadsheet = _open_spreadsheet()
++    try:
++        worksheet = spreadsheet.worksheet(sheet_name)
++    except gspread.exceptions.WorksheetNotFound:
++        worksheet = spreadsheet.add_worksheet(title=sheet_name, rows=100, cols=len(HEADERS))
++        worksheet.update("1:1", [HEADERS])
+     else:
+-        df = pd.concat(
++        _ensure_headers(worksheet)
++    return worksheet
++
++
++def get_sheet_by_name(sheet_name: str) -> Optional[gspread.Worksheet]:
++    spreadsheet = _open_spreadsheet()
++    try:
++        worksheet = spreadsheet.worksheet(sheet_name)
++    except gspread.exceptions.WorksheetNotFound:
++        return None
++    _ensure_headers(worksheet)
++    return worksheet
++
++
++def get_current_worksheet() -> gspread.Worksheet:
++    settings = load_settings()
++    sheet_name = settings.get("current_event_sheet_name")
++    if not sheet_name:
++        raise RuntimeError("Активный лист события не настроен")
++    worksheet = get_sheet_by_name(sheet_name)
++    if worksheet is None:
++        worksheet = create_event_sheet(sheet_name)
++    return worksheet
++
++
++def _now_timestamp() -> str:
++    return datetime.now(TZ).isoformat()
++
++
++def _find_row_by_chat_id(worksheet: gspread.Worksheet, chat_id: int) -> Optional[int]:
++    chat_id_str = str(chat_id)
++    values = worksheet.col_values(2)
++    for idx, value in enumerate(values, start=1):
++        if value.strip() == chat_id_str:
++            return idx
++    return None
++
++
++def _normalize_username(username: str) -> str:
++    username = username.strip()
++    if username and not username.startswith("@"):
++        return f"@{username}"
++    return username
++
++
++def register_participant(participant: Participant) -> None:
++    worksheet = get_current_worksheet()
++    row_idx = _find_row_by_chat_id(worksheet, participant.chat_id)
++    timestamp = _now_timestamp()
++    username = _normalize_username(participant.username)
++    if row_idx:
++        existing = worksheet.row_values(row_idx)
++        role = existing[5] if len(existing) > 5 else participant.role
++        paid = existing[6] if len(existing) > 6 else participant.paid
++        feedback = existing[7] if len(existing) > 7 else participant.feedback
++        worksheet.update(
++            f"A{row_idx}:H{row_idx}",
+             [
+-                df,
+-                pd.DataFrame(
+-                    [
+-                        [
+-                            participant.name,
+-                            participant.username,
+-                            participant.chat_id,
+-                            participant.email,
+-                            participant.participation_type,
+-                            participant.payment_status,
+-                            participant.feedback,
+-                        ]
+-                    ],
+-                    columns=COLUMNS,
+-                ),
++                [
++                    timestamp,
++                    str(participant.chat_id),
++                    username,
++                    participant.name,
++                    participant.email,
++                    role or participant.role,
++                    paid or participant.paid,
++                    feedback or participant.feedback,
++                ]
+             ],
+-            ignore_index=True,
+         )
+-    df.to_excel(DATABASE_PATH, index=False)
++    else:
++        worksheet.append_row(
++            [
++                timestamp,
++                str(participant.chat_id),
++                username,
++                participant.name,
++                participant.email,
++                participant.role,
++                participant.paid,
++                participant.feedback,
++            ]
++        )
+ 
+ 
+-def update_participation(chat_id: int, participation_type: str, payment_status: str) -> None:
+-    df = _load_dataframe()
+-    mask = df["ChatID"] == chat_id
+-    if not mask.any():
++def update_participation(chat_id: int, role: str, paid: str) -> None:
++    worksheet = get_current_worksheet()
++    row_idx = _find_row_by_chat_id(worksheet, chat_id)
++    if not row_idx:
+         return
+-    df.loc[mask, ["Формат", "Оплата"]] = [participation_type, payment_status]
+-    df.to_excel(DATABASE_PATH, index=False)
++    worksheet.update(f"F{row_idx}:G{row_idx}", [[role, paid]])
+ 
+ 
+ def update_feedback(chat_id: int, feedback: str) -> None:
+-    df = _load_dataframe()
+-    mask = df["ChatID"] == chat_id
+-    if not mask.any():
++    worksheet = get_current_worksheet()
++    row_idx = _find_row_by_chat_id(worksheet, chat_id)
++    if not row_idx:
+         return
+-    df.loc[mask, "Фидбэк"] = feedback
+-    df.to_excel(DATABASE_PATH, index=False)
++    worksheet.update(f"H{row_idx}", feedback)
+ 
+ 
+-def get_participants() -> pd.DataFrame:
+-    return _load_dataframe()
++def get_participants(sheet_name: Optional[str] = None) -> pd.DataFrame:
++    worksheet = get_current_worksheet() if sheet_name is None else get_or_create_sheet(sheet_name)
++    records = worksheet.get_all_records()
++    if not records:
++        return pd.DataFrame(columns=HEADERS)
++    return pd.DataFrame(records, columns=HEADERS)
+ 
+ 
+ def list_chat_ids() -> List[int]:
+-    df = _load_dataframe()
+-    return [int(cid) for cid in df["ChatID"].dropna().tolist()]
++    worksheet = get_current_worksheet()
++    values = worksheet.col_values(2)
++    chat_ids: List[int] = []
++    for value in values[1:]:  # skip header
++        value = value.strip()
++        if not value:
++            continue
++        try:
++            chat_ids.append(int(float(value)))
++        except ValueError:
++            continue
++    return chat_ids
+ 
+ 
+ def export_database(destination: Optional[Path] = None) -> Path:
+-    """Create a copy of the database and return the file path."""
+-    ensure_database()
++    """Create an XLSX export of the current participant list."""
++    df = get_participants()
+     if destination is None:
+-        destination = DATABASE_PATH
+-    else:
+-        destination.parent.mkdir(parents=True, exist_ok=True)
+-        df = _load_dataframe()
+-        df.to_excel(destination, index=False)
+-        return destination
++        destination = DATA_DIR / "participants.xlsx"
++    destination.parent.mkdir(parents=True, exist_ok=True)
++    df.to_excel(destination, index=False)
+     return destination
++
++
++def get_sheet_link(sheet_name: Optional[str] = None, gid: Optional[int] = None) -> str:
++    if sheet_name is None:
++        settings = load_settings()
++        sheet_name = settings.get("current_event_sheet_name")
++        gid = settings.get("current_event_sheet_gid")
++    if not sheet_name:
++        raise RuntimeError("Активный лист события не настроен")
++    if gid is None:
++        worksheet = get_sheet_by_name(sheet_name)
++        if worksheet is None:
++            worksheet = create_event_sheet(sheet_name)
++        gid = worksheet.id
++    return f"https://docs.google.com/spreadsheets/d/{GSPREAD_SHEET_ID}/edit#gid={gid}"
++
++
++def get_or_create_sheet(sheet_name: str) -> gspread.Worksheet:
++    worksheet = get_sheet_by_name(sheet_name)
++    if worksheet is None:
++        worksheet = create_event_sheet(sheet_name)
++    return worksheet
++
+diff --git a/handlers.py b/handlers.py
+index d2b58dea74e4d5a5425e6ca6c746e8414ae3fbd3..1494baa334701b2125db8ef760f1542d0ab040d2 100644
+--- a/handlers.py
++++ b/handlers.py
+@@ -24,81 +24,88 @@ EMAIL_REGEX = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+ 
+ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+     user = update.effective_user
+     if user and is_admin(chat_id=user.id, username=user.username):
+         from admin_panel import send_admin_panel
+ 
+         await send_admin_panel(update, context)
+         return ConversationHandler.END
+ 
+     await update.message.reply_text(
+         "Добро пожаловать на вебинар по психологии!\n"
+         "Пожалуйста, укажите ваш e-mail для регистрации.",
+         reply_markup=ReplyKeyboardRemove(),
+     )
+     return WAITING_EMAIL
+ 
+ 
+ async def handle_email(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+     email = (update.message.text or "").strip()
+     if not EMAIL_REGEX.match(email):
+         await update.message.reply_text("Похоже, это не e-mail. Попробуйте снова.")
+         return WAITING_EMAIL
+ 
+     user = update.effective_user
+     participant = database.Participant(
+-        name=user.full_name,
+-        username=f"@{user.username}" if user.username else "",
++        name=(user.full_name or "") if user else "",
++        username=f"@{user.username}" if user and user.username else "",
+         chat_id=update.effective_chat.id,
+         email=email,
+     )
+-    database.add_or_update_participant(participant)
++    try:
++        database.register_participant(participant)
++    except RuntimeError:
++        await update.message.reply_text(
++            "Регистрация временно недоступна. Пожалуйста, попробуйте позже.",
++            reply_markup=ReplyKeyboardRemove(),
++        )
++        return ConversationHandler.END
+ 
+     await update.message.reply_text(
+         "Вы зарегистрированы на вебинар 💫 Ссылка придёт в день проведения.",
+     )
+ 
+     keyboard = ReplyKeyboardMarkup([[FREE_BUTTON], [PAID_BUTTON]], resize_keyboard=True)
+     await update.message.reply_text("Выберите формат участия:", reply_markup=keyboard)
+     return WAITING_FORMAT
+ 
+ 
+ async def handle_format(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+     choice = (update.message.text or "").strip()
+     settings = load_settings()
+     payment_link = settings.get("payment_link", "")
+ 
+     if choice == FREE_BUTTON:
+-        database.update_participation(update.effective_chat.id, "free", "нет")
++        database.update_participation(update.effective_chat.id, "free", "no")
+         await update.message.reply_text(
+             "Вы выбрали формат наблюдателя. Ждите ссылку в день вебинара!",
+             reply_markup=ReplyKeyboardRemove(),
+         )
+         return ConversationHandler.END
+ 
+     if choice == PAID_BUTTON:
+-        database.update_participation(update.effective_chat.id, "paid", "ожидает оплаты")
++        database.update_participation(update.effective_chat.id, "paid", "no")
+         if payment_link:
+             message = f"Для оплаты используйте ссылку: {payment_link}"
+         else:
+             message = "Ссылка для оплаты пока не задана. Свяжитесь с организатором."
+         await update.message.reply_text(message, reply_markup=ReplyKeyboardRemove())
+         return ConversationHandler.END
+ 
+     await update.message.reply_text(
+         "Пожалуйста, используйте кнопки для выбора формата участия."
+     )
+     return WAITING_FORMAT
+ 
+ 
+ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+     await update.message.reply_text(
+         "Регистрация отменена.", reply_markup=ReplyKeyboardRemove()
+     )
+     return ConversationHandler.END
+ 
+ 
+ async def feedback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+     chat_id = update.effective_chat.id
+     awaiting = context.application.bot_data.setdefault("awaiting_feedback", set())
+     if chat_id not in awaiting:
+         return
+diff --git a/main.py b/main.py
+index 2df2ff35363658fc1948be94b4f8460f2f415b76..2dab7fa78f4974bc7d849b94202d0a8e1b9eb869 100644
+--- a/main.py
++++ b/main.py
+@@ -1,32 +1,31 @@
+ """Entry point for the psychology webinar Telegram bot."""
+ from __future__ import annotations
+ 
+ from telegram.ext import Application, MessageHandler, filters
+ 
+ import config
+ import database
+ from admin_panel import build_admin_conversation
+ from handlers import build_conversation_handler, feedback_handler
+ from scheduler import ensure_scheduler_started, schedule_all_reminders
+ 
+ 
+ async def _post_init(application: Application) -> None:
+     config.ensure_data_dir()
+-    database.ensure_database()
+     ensure_scheduler_started()
+     schedule_all_reminders(application)
+ 
+ 
+ def main() -> None:
+     application = Application.builder().token(config.BOT_TOKEN).build()
+     application.post_init = _post_init
+ 
+     application.add_handler(build_conversation_handler())
+     application.add_handler(build_admin_conversation())
+     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, feedback_handler))
+ 
+     application.run_polling()
+ 
+ 
+ if __name__ == "__main__":
+     main()
+diff --git a/requirements.txt b/requirements.txt
+index 7c0ab9b670cd6f641f4afae5946b6577c1f9aaef..fdaa8dd647a6ea3ae1614ef57891ffca22a1ba54 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1,4 +1,7 @@
+ python-telegram-bot==20.7
+ apscheduler==3.10.4
+ pandas==2.2.2
+ openpyxl==3.1.2
++gspread==6.1.2
++google-auth==2.30.0
++Unidecode==1.3.8
+diff --git a/scheduler.py b/scheduler.py
+index b3f944967b0af87da19b16f1916edd8d5ee8e7ca..07281808c27c514123e675b765d8518e17a8bf67 100644
+--- a/scheduler.py
++++ b/scheduler.py
+@@ -1,67 +1,105 @@
+-"""Apscheduler integration for webinar reminders."""
++"""Apscheduler integration for webinar reminders bound to Google Sheets events."""
+ from __future__ import annotations
+ 
+ from datetime import datetime, timedelta
++from zoneinfo import ZoneInfo
+ 
+ from apscheduler.schedulers.asyncio import AsyncIOScheduler
+ from apscheduler.triggers.date import DateTrigger
+ 
+ import database
+-from config import load_settings
++from config import TIMEZONE, load_settings
+ 
+-scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
++scheduler = AsyncIOScheduler(timezone=ZoneInfo(TIMEZONE))
+ 
+ 
+ async def _send_bulk_message(application, text: str) -> None:
+     participants = database.get_participants()
+     for _, row in participants.iterrows():
+-        chat_id = int(row["ChatID"])
++        chat_id = row.get("chat_id")
+         if not chat_id:
+             continue
+-        await application.bot.send_message(chat_id=chat_id, text=text)
++        try:
++            chat_id_int = int(chat_id)
++        except (TypeError, ValueError):
++            continue
++        await application.bot.send_message(chat_id=chat_id_int, text=text)
+ 
+ 
+ async def _send_feedback_request(application, text: str) -> None:
+     participants = database.get_participants()
+     waiting_feedback = application.bot_data.setdefault("awaiting_feedback", set())
+     for _, row in participants.iterrows():
+-        chat_id = int(row["ChatID"])
++        chat_id = row.get("chat_id")
+         if not chat_id:
+             continue
+-        waiting_feedback.add(chat_id)
+-        await application.bot.send_message(chat_id=chat_id, text=text)
++        try:
++            chat_id_int = int(chat_id)
++        except (TypeError, ValueError):
++            continue
++        waiting_feedback.add(chat_id_int)
++        await application.bot.send_message(chat_id=chat_id_int, text=text)
++
+ 
++def _clear_event_jobs(event_id: str) -> None:
++    for job in scheduler.get_jobs():
++        if job.id and job.id.startswith(f"{event_id}::"):
++            scheduler.remove_job(job.id)
+ 
+-def _schedule_job(run_time: datetime, coroutine, *args) -> None:
++
++def _schedule_job(job_id: str, run_time: datetime, coroutine, *args) -> None:
+     if run_time <= datetime.now(run_time.tzinfo):
+         return
+-    scheduler.add_job(coroutine, trigger=DateTrigger(run_date=run_time), args=args, misfire_grace_time=300)
++    scheduler.add_job(
++        coroutine,
++        trigger=DateTrigger(run_date=run_time),
++        args=args,
++        id=job_id,
++        replace_existing=True,
++        misfire_grace_time=300,
++    )
+ 
+ 
+ def schedule_all_reminders(application) -> None:
+     settings = load_settings()
+-    event_iso = settings.get("event_datetime")
+-    if not event_iso:
++    event_iso = settings.get("current_event_datetime")
++    event_id = settings.get("current_event_id")
++    if not event_iso or not event_id:
++        scheduler.remove_all_jobs()
+         return
+ 
+     event_dt = datetime.fromisoformat(event_iso)
+-    scheduler.remove_all_jobs()
++    _clear_event_jobs(event_id)
+ 
+     zoom_link = settings.get("zoom_link", "")
+ 
+     day_before = event_dt - timedelta(days=1)
+     hour_before = event_dt - timedelta(hours=1)
+     day_after = event_dt + timedelta(days=1)
+ 
+-    text_day_before = "Напоминаем, вебинар уже завтра! 💫\n" + (f"Ваша ссылка: {zoom_link}" if zoom_link else "")
+-    text_hour_before = "Скоро начинаем! Вот ваша ссылка: {link}".format(link=zoom_link or "Ссылка появится позже")
++    text_day_before = "Напоминаем, вебинар уже завтра! 💫"
++    if zoom_link:
++        text_day_before += f"\nВаша ссылка: {zoom_link}"
++
++    text_hour_before = "Скоро начинаем!"
++    if zoom_link:
++        text_hour_before += f" Вот ваша ссылка: {zoom_link}"
++    else:
++        text_hour_before += " Ссылка появится позже."
++
+     text_day_after = "Спасибо, что были с нами 💕 Поделитесь впечатлениями?"
+ 
+-    _schedule_job(day_before, _send_bulk_message, application, text_day_before)
+-    _schedule_job(hour_before, _send_bulk_message, application, text_hour_before)
+-    _schedule_job(day_after, _send_feedback_request, application, text_day_after)
++    _schedule_job(f"{event_id}::day_before", day_before, _send_bulk_message, application, text_day_before)
++    _schedule_job(f"{event_id}::hour_before", hour_before, _send_bulk_message, application, text_hour_before)
++    _schedule_job(
++        f"{event_id}::feedback",
++        day_after,
++        _send_feedback_request,
++        application,
++        text_day_after,
++    )
+ 
+ 
+ def ensure_scheduler_started() -> None:
+     if not scheduler.running:
+         scheduler.start()
 

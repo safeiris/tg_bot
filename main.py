@@ -12,7 +12,6 @@ from scheduler import ensure_scheduler_started, schedule_all_reminders
 
 async def _post_init(application: Application) -> None:
     config.ensure_data_dir()
-    database.ensure_database()
     ensure_scheduler_started()
     schedule_all_reminders(application)
 

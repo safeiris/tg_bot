@@ -31,9 +31,13 @@ SETTINGS_FILE = DATA_DIR / "config.json"
 _DEFAULT_SETTINGS: Dict[str, Any] = {
     "topic": "Психологический вебинар",
     "description": "Авторский вебинар по психологии",
-    "event_datetime": None,  # ISO formatted date time string
+    "current_event_id": None,
+    "current_event_sheet_name": None,
+    "current_event_sheet_gid": None,
+    "current_event_datetime": None,  # ISO formatted date time string in TIMEZONE
     "zoom_link": "",
     "payment_link": "",
+    "timezone": TIMEZONE,
 }
 
 
