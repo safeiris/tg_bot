@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse
 
 from telegram import ReplyKeyboardMarkup, ReplyKeyboardRemove, Update
 from telegram.constants import ParseMode
@@ -18,17 +19,48 @@ import database
 from config import is_admin, load_settings, update_settings
 from scheduler import ensure_scheduler_started, schedule_all_reminders
 
+BUTTON_SET_DATE = "📆 Изменить дату"
+BUTTON_SET_TOPIC = "✏️ Изменить название"
+BUTTON_SET_DESCRIPTION = "📝 Изменить описание"
+BUTTON_SET_ZOOM = "🔗 Обновить Zoom"
+BUTTON_SET_PAYMENT = "💳 Обновить оплату"
+BUTTON_EXPORT = "📥 Список участников"
+BUTTON_NOTIFY = "📢 Разослать напоминание"
+BUTTON_SHOW_EVENT = "🗓 Просмотр текущего мероприятия"
+
 MENU_KEYBOARD = ReplyKeyboardMarkup(
     [
-        ["📆 Изменить дату", "📝 Изменить тему"],
-        ["🔗 Обновить Zoom", "💳 Обновить оплату"],
-        ["📥 Список участников", "📢 Разослать напоминание"],
-        ["🗓 Просмотр текущего мероприятия"],
+        [BUTTON_SET_DATE, BUTTON_SET_TOPIC],
+        [BUTTON_SET_DESCRIPTION],
+        [BUTTON_SET_ZOOM, BUTTON_SET_PAYMENT],
+        [BUTTON_EXPORT, BUTTON_NOTIFY],
+        [BUTTON_SHOW_EVENT],
     ],
     resize_keyboard=True,
 )
 
-STATE_TOPIC, STATE_DATE, STATE_ZOOM, STATE_PAYMENT, STATE_NOTIFY = range(5)
+STATE_TOPIC, STATE_DATE, STATE_ZOOM, STATE_PAYMENT, STATE_NOTIFY, STATE_DESCRIPTION = range(6)
+
+CANCEL_TEXT = "отмена"
+CLEAR_TEXT = "очистить"
+TOPIC_MAX_LENGTH = 200
+
+
+def _normalize_command_text(text: str | None) -> str:
+    return (text or "").strip().lower()
+
+
+def _is_cancel(text: str | None) -> bool:
+    return _normalize_command_text(text) == CANCEL_TEXT
+
+
+def _is_clear(text: str | None) -> bool:
+    return _normalize_command_text(text) == CLEAR_TEXT
+
+
+def _is_valid_url(value: str) -> bool:
+    parsed = urlparse(value)
+    return bool(parsed.scheme in {"http", "https"} and parsed.netloc)
 
 
 MISSING_VALUE = "❗️Не указано администратором"
@@ -110,11 +142,11 @@ async def send_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     settings = load_settings()
     text = (
         "<b>Панель администратора</b>\n\n"
-        f"Тема: {settings.get('topic')}\n"
-        f"Описание: {settings.get('description')}\n"
-        f"Дата: {settings.get('event_datetime') or 'не задана'}\n"
-        f"Zoom: {settings.get('zoom_link') or 'не задан'}\n"
-        f"Оплата: {settings.get('payment_link') or 'не задана'}"
+        f"Название: {_format_value(settings.get('topic'))}\n"
+        f"Описание: {_format_value(settings.get('description'))}\n"
+        f"Дата: {_format_value(settings.get('event_datetime'))}\n"
+        f"Zoom: {_format_value(settings.get('zoom_link'))}\n"
+        f"Оплата: {_format_value(settings.get('payment_link'))}"
     )
     if update.message:
         await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=MENU_KEYBOARD)
@@ -208,8 +240,8 @@ async def set_topic_start(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not await _ensure_admin(update):
         return ConversationHandler.END
     await update.message.reply_text(
-        "Введите новую тему и описание через символ \"|\".\n"
-        "Например: Мой вебинар | Погружение в психологию",
+        "Введите новое название мероприятия (до 200 символов).\n"
+        "Доступные команды: Отмена.",
         reply_markup=ReplyKeyboardRemove(),
     )
     return STATE_TOPIC
@@ -218,11 +250,64 @@ async def set_topic_start(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def set_topic_finish(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not await _ensure_admin(update):
         return ConversationHandler.END
-    payload = (update.message.text or "").split("|", maxsplit=1)
-    topic = payload[0].strip() if payload else ""
-    description = payload[1].strip() if len(payload) > 1 else ""
-    update_settings(topic=topic or None, description=description or None)
-    await update.message.reply_text("Тема и описание обновлены.", reply_markup=MENU_KEYBOARD)
+    text = (update.message.text or "").strip()
+
+    if _is_cancel(text):
+        await update.message.reply_text("Изменение названия отменено.", reply_markup=MENU_KEYBOARD)
+        return ConversationHandler.END
+
+    if not text:
+        await update.message.reply_text("Название не может быть пустым. Попробуйте снова.")
+        return STATE_TOPIC
+
+    if len(text) > TOPIC_MAX_LENGTH:
+        await update.message.reply_text(
+            f"Название слишком длинное. Максимум {TOPIC_MAX_LENGTH} символов."
+        )
+        return STATE_TOPIC
+
+    update_settings(topic=text)
+    await show_current_event(update, context)
+    await update.message.reply_text("✅ Название обновлено.", reply_markup=MENU_KEYBOARD)
+    return ConversationHandler.END
+
+
+async def set_description_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await _ensure_admin(update):
+        return ConversationHandler.END
+    await update.message.reply_text(
+        "Отправьте новое описание мероприятия.\n"
+        "Доступные команды: Отмена, Очистить.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    return STATE_DESCRIPTION
+
+
+async def set_description_finish(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if not await _ensure_admin(update):
+        return ConversationHandler.END
+
+    raw_text = update.message.text or ""
+    if _is_cancel(raw_text):
+        await update.message.reply_text("Изменение описания отменено.", reply_markup=MENU_KEYBOARD)
+        return ConversationHandler.END
+
+    if _is_clear(raw_text):
+        update_settings(description=None)
+        await show_current_event(update, context)
+        await update.message.reply_text("Описание очищено.", reply_markup=MENU_KEYBOARD)
+        return ConversationHandler.END
+
+    stripped = raw_text.strip()
+    if not stripped:
+        await update.message.reply_text(
+            "Описание не может быть пустым. Введите текст или используйте Очистить."
+        )
+        return STATE_DESCRIPTION
+
+    update_settings(description=stripped)
+    await show_current_event(update, context)
+    await update.message.reply_text("✅ Описание обновлено.", reply_markup=MENU_KEYBOARD)
     return ConversationHandler.END
 
 
@@ -261,24 +346,48 @@ async def set_date_finish(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return STATE_DATE
 
     update_settings(event_datetime=event_dt.isoformat())
-    await update.message.reply_text("Дата вебинара обновлена.", reply_markup=MENU_KEYBOARD)
     ensure_scheduler_started()
     schedule_all_reminders(context.application)
+    await show_current_event(update, context)
+    await update.message.reply_text("Дата вебинара обновлена.", reply_markup=MENU_KEYBOARD)
     return ConversationHandler.END
 
 
 async def set_zoom_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not await _ensure_admin(update):
         return ConversationHandler.END
-    await update.message.reply_text("Отправьте новую Zoom-ссылку:", reply_markup=ReplyKeyboardRemove())
+    await update.message.reply_text(
+        "Отправьте новую Zoom-ссылку.\nДоступные команды: Отмена, Очистить.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
     return STATE_ZOOM
 
 
 async def set_zoom_finish(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not await _ensure_admin(update):
         return ConversationHandler.END
-    link = (update.message.text or "").strip()
+    text = update.message.text or ""
+
+    if _is_cancel(text):
+        await update.message.reply_text("Обновление Zoom-ссылки отменено.", reply_markup=MENU_KEYBOARD)
+        return ConversationHandler.END
+
+    if _is_clear(text):
+        update_settings(zoom_link=None)
+        await show_current_event(update, context)
+        await update.message.reply_text("Ссылка Zoom очищена.", reply_markup=MENU_KEYBOARD)
+        schedule_all_reminders(context.application)
+        return ConversationHandler.END
+
+    link = text.strip()
+    if not link or not _is_valid_url(link):
+        await update.message.reply_text(
+            "Укажите корректную ссылку (http/https) или используйте команды Отмена/Очистить."
+        )
+        return STATE_ZOOM
+
     update_settings(zoom_link=link)
+    await show_current_event(update, context)
     await update.message.reply_text("Ссылка Zoom обновлена.", reply_markup=MENU_KEYBOARD)
     schedule_all_reminders(context.application)
     return ConversationHandler.END
@@ -287,15 +396,37 @@ async def set_zoom_finish(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def set_payment_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not await _ensure_admin(update):
         return ConversationHandler.END
-    await update.message.reply_text("Отправьте ссылку на оплату (Robokassa):", reply_markup=ReplyKeyboardRemove())
+    await update.message.reply_text(
+        "Отправьте ссылку на оплату (http/https).\nДоступные команды: Отмена, Очистить.",
+        reply_markup=ReplyKeyboardRemove(),
+    )
     return STATE_PAYMENT
 
 
 async def set_payment_finish(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not await _ensure_admin(update):
         return ConversationHandler.END
-    link = (update.message.text or "").strip()
+    text = update.message.text or ""
+
+    if _is_cancel(text):
+        await update.message.reply_text("Обновление ссылки на оплату отменено.", reply_markup=MENU_KEYBOARD)
+        return ConversationHandler.END
+
+    if _is_clear(text):
+        update_settings(payment_link=None)
+        await show_current_event(update, context)
+        await update.message.reply_text("Ссылка на оплату очищена.", reply_markup=MENU_KEYBOARD)
+        return ConversationHandler.END
+
+    link = text.strip()
+    if not link or not _is_valid_url(link):
+        await update.message.reply_text(
+            "Укажите корректную ссылку (http/https) или используйте команды Отмена/Очистить."
+        )
+        return STATE_PAYMENT
+
     update_settings(payment_link=link)
+    await show_current_event(update, context)
     await update.message.reply_text("Ссылка на оплату обновлена.", reply_markup=MENU_KEYBOARD)
     return ConversationHandler.END
 
@@ -340,7 +471,8 @@ def build_admin_conversation() -> ConversationHandler:
             CommandHandler("export", export_participants),
             CommandHandler("notify", notify_start),
             CommandHandler("current_event", show_current_event),
-            MessageHandler(filters.Regex("^📝"), set_topic_start),
+            MessageHandler(filters.Regex("^✏️"), set_topic_start),
+            MessageHandler(filters.Regex("^📝 Изменить описание$"), set_description_start),
             MessageHandler(filters.Regex("^📆"), set_date_start),
             MessageHandler(filters.Regex("^🔗"), set_zoom_start),
             MessageHandler(filters.Regex("^💳"), set_payment_start),
@@ -354,6 +486,7 @@ def build_admin_conversation() -> ConversationHandler:
             STATE_ZOOM: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_zoom_finish)],
             STATE_PAYMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_payment_finish)],
             STATE_NOTIFY: [MessageHandler(filters.TEXT & ~filters.COMMAND, notify_finish)],
+            STATE_DESCRIPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_description_finish)],
         },
         fallbacks=[CommandHandler("cancel", admin_command_entry)],
         allow_reentry=True,
