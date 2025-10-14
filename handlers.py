@@ -612,14 +612,19 @@ async def _handle_registration(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def _handle_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    chat = update.effective_chat
+    if chat is None:
+        return PANEL
+    chat_id = chat.id
     context.user_data["awaiting_feedback"] = True
-    await _render_user_panel(
-        update=update,
-        context=context,
-        status_message="Напишите ваш отзыв одним сообщением.",
-    )
     awaiting = context.application.bot_data.setdefault("awaiting_feedback", set())
-    awaiting.add(update.effective_chat.id)
+    awaiting.add(chat_id)
+    instruction = "📝 Напишите ваш отзыв одним сообщением (например: «Все понравилось, спасибо!»)."
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=instruction,
+        reply_markup=_build_restart_reply_keyboard(),
+    )
     return WAITING_FEEDBACK
 
 
@@ -871,11 +876,25 @@ async def handle_feedback_text(update: Update, context: ContextTypes.DEFAULT_TYP
             reply_markup=_build_restart_reply_keyboard(),
         )
         return WAITING_FEEDBACK
-    database.update_feedback(chat_id, feedback)
+    try:
+        saved = database.update_feedback(chat_id, feedback)
+    except Exception:
+        logger.exception("Failed to save feedback for %s", chat_id)
+        await update.message.reply_text(
+            "Не получилось сохранить, попробуйте ещё раз.",
+            reply_markup=_build_restart_reply_keyboard(),
+        )
+        return WAITING_FEEDBACK
+    if not saved:
+        await update.message.reply_text(
+            "Не получилось сохранить, попробуйте ещё раз.",
+            reply_markup=_build_restart_reply_keyboard(),
+        )
+        return WAITING_FEEDBACK
     awaiting = context.application.bot_data.setdefault("awaiting_feedback", set())
     awaiting.discard(chat_id)
     await update.message.reply_text(
-        "Спасибо за обратную связь! 💖",
+        "Спасибо! Ваш отзыв записан.",
         reply_markup=_build_restart_reply_keyboard(),
     )
     await _refresh_panel_from_state(
@@ -910,12 +929,32 @@ async def feedback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
     if not feedback:
         return
-    database.update_feedback(chat_id, feedback)
+    try:
+        saved = database.update_feedback(chat_id, feedback)
+    except Exception:
+        logger.exception("Failed to save feedback for %s", chat_id)
+        await update.message.reply_text(
+            "Не получилось сохранить, попробуйте ещё раз.",
+            reply_markup=_build_restart_reply_keyboard(),
+        )
+        return
+    if not saved:
+        await update.message.reply_text(
+            "Не получилось сохранить, попробуйте ещё раз.",
+            reply_markup=_build_restart_reply_keyboard(),
+        )
+        return
     awaiting.discard(chat_id)
     await update.message.reply_text(
-        "Спасибо за обратную связь! 💖",
+        "Спасибо! Ваш отзыв записан.",
         reply_markup=_build_restart_reply_keyboard(),
     )
+    await _refresh_panel_from_state(
+        context=context,
+        chat_id=chat_id,
+        status_message="Отзыв сохранён.",
+    )
+    context.user_data.pop("awaiting_feedback", None)
 
 
 def build_conversation_handler() -> ConversationHandler:

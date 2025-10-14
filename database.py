@@ -337,17 +337,18 @@ def update_participation(chat_id: int, role: str, paid: str) -> None:
     worksheet.update(f"{start}:{end}", values)
 
 
-def update_feedback(chat_id: int, feedback: str) -> None:
+def update_feedback(chat_id: int, feedback: str) -> bool:
     worksheet = get_current_worksheet()
     header_map = _header_map(worksheet)
     row_idx = _find_row_by_chat_id(worksheet, chat_id, header_map)
     if not row_idx:
-        return
+        return False
     feedback_col = header_map.get("Обратная связь")
     if not feedback_col:
-        return
+        return False
     cell = rowcol_to_a1(row_idx, feedback_col)
     worksheet.update(cell, feedback)
+    return True
 
 
 def get_participants(sheet_name: Optional[str] = None) -> pd.DataFrame:
