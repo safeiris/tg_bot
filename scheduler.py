@@ -1,23 +1,51 @@
 """Apscheduler integration for webinar reminders bound to Google Sheets events."""
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 import database
 from config import TIMEZONE, load_settings
 from events import classify_status, get_event
+from message_templates import get_event_context
 
 scheduler = AsyncIOScheduler(timezone=ZoneInfo(TIMEZONE))
 
+logger = logging.getLogger(__name__)
 
-async def _send_bulk_message(application, event_id: str, text: str) -> None:
+
+async def _send_timed_reminder(application, event_id: str, label: str) -> None:
     event = get_event(event_id)
     if not event or classify_status(event) == "cancelled":
         return
+    settings = load_settings()
+    ctx = get_event_context(settings)
+    zoom_link = (settings.get("zoom_link") or "").strip()
+
+    if label == "day":
+        text = (
+            f"Напоминаем: уже завтра встречаемся на «{ctx['title']}».\n"
+            f"Старт {ctx['local_datetime']} ({ctx['timezone']})."
+        )
+    else:
+        text = (
+            f"Через час начинаем «{ctx['title']}»!\n"
+            f"Старт в {ctx['local_datetime']} ({ctx['timezone']})."
+        )
+
+    reply_markup: InlineKeyboardMarkup | None = None
+    if zoom_link:
+        reply_markup = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("Войти на вебинар", url=zoom_link)]]
+        )
+    else:
+        text += "\n\nСсылка появится здесь, как только админ её добавит."
+
     participants = database.get_participants()
     for _, row in participants.iterrows():
         chat_id = row.get("chat_id")
@@ -27,7 +55,15 @@ async def _send_bulk_message(application, event_id: str, text: str) -> None:
             chat_id_int = int(chat_id)
         except (TypeError, ValueError):
             continue
-        await application.bot.send_message(chat_id=chat_id_int, text=text)
+        try:
+            await application.bot.send_message(
+                chat_id=chat_id_int,
+                text=text,
+                reply_markup=reply_markup,
+                disable_web_page_preview=True,
+            )
+        except Exception as exc:  # pragma: no cover - best effort
+            logger.debug("Failed to send reminder to %s: %s", chat_id, exc)
 
 
 async def _send_feedback_request(application, event_id: str, text: str) -> None:
@@ -82,39 +118,27 @@ def schedule_all_reminders(application) -> None:
     event_dt = datetime.fromisoformat(event_iso)
     _clear_event_jobs(event_id)
 
-    zoom_link = settings.get("zoom_link", "")
-
     day_before = event_dt - timedelta(days=1)
     hour_before = event_dt - timedelta(hours=1)
     day_after = event_dt + timedelta(days=1)
-
-    text_day_before = "Напоминаем, вебинар уже завтра! 💫"
-    if zoom_link:
-        text_day_before += f"\nВаша ссылка: {zoom_link}"
-
-    text_hour_before = "Скоро начинаем!"
-    if zoom_link:
-        text_hour_before += f" Вот ваша ссылка: {zoom_link}"
-    else:
-        text_hour_before += " Ссылка появится позже."
 
     text_day_after = "Спасибо, что были с нами 💕 Поделитесь впечатлениями?"
 
     _schedule_job(
         f"{event_id}::day_before",
         day_before,
-        _send_bulk_message,
+        _send_timed_reminder,
         application,
         event_id,
-        text_day_before,
+        "day",
     )
     _schedule_job(
         f"{event_id}::hour_before",
         hour_before,
-        _send_bulk_message,
+        _send_timed_reminder,
         application,
         event_id,
-        text_hour_before,
+        "hour",
     )
     _schedule_job(
         f"{event_id}::feedback",

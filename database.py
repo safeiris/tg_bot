@@ -38,8 +38,8 @@ HEADERS = [
     "Обратная связь",
 ]
 
-ROLE_FREE = "Бесплатный"
-ROLE_PAID = "Платный"
+ROLE_FREE = "Наблюдатель (бесплатно)"
+ROLE_PAID = "Участник с разбором (платно)"
 PAYMENT_PAID = "Оплачено"
 PAYMENT_UNPAID = "Не оплачено"
 
@@ -54,7 +54,7 @@ class Participant:
     username: str
     chat_id: int
     email: str
-    role: str = "free"
+    role: str = ROLE_FREE
     paid: str = "no"
     feedback: str = ""
 
@@ -100,7 +100,7 @@ def _row_dict(
 
 def _format_role(value: str) -> str:
     normalized = (value or "").strip().lower()
-    if normalized in {
+    paid_aliases = {
         "paid",
         "платный",
         "платно",
@@ -108,10 +108,31 @@ def _format_role(value: str) -> str:
         "платное",
         "платные",
         "участник",
+        "участник с разбором",
+        "участие с разбором",
+        "с разбором",
         ROLE_PAID.lower(),
-    }:
+    }
+    free_aliases = {
+        "free",
+        "наблюдатель",
+        "наблюдатель (бесплатно)",
+        "бесплатно",
+        ROLE_FREE.lower(),
+    }
+    if normalized in paid_aliases:
+        return ROLE_PAID
+    if normalized in free_aliases:
+        return ROLE_FREE
+    if "разбор" in normalized:
         return ROLE_PAID
     return ROLE_FREE
+
+
+def format_role(value: str) -> str:
+    """Return a normalized role label for display purposes."""
+
+    return _format_role(value)
 
 
 def _format_payment_status(value: str) -> str:

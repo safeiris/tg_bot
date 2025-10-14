@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Optional
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -18,16 +18,23 @@ from telegram.ext import (
 
 import database
 from config import TIMEZONE, is_admin, load_settings
-from message_templates import build_free_confirmation, get_event_context
-from notifications import send_paid_confirmation
-from reminders import cancel_personal_reminder, schedule_personal_reminder
+from database import ROLE_FREE, ROLE_PAID, format_role
+from message_templates import (
+    build_free_confirmation,
+    build_paid_pending_confirmation,
+    get_event_context,
+)
 from zoneinfo import ZoneInfo
 
 from admin_panel import show_main_menu
 
 EMAIL_REGEX = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
-PANEL, WAITING_EMAIL, WAITING_FEEDBACK = range(3)
+PANEL, WAITING_EMAIL, WAITING_ROLE, WAITING_FEEDBACK = range(4)
+
+ROLE_CALLBACK_PREFIX = "role:"
+ROLE_OBSERVER = f"{ROLE_CALLBACK_PREFIX}observer"
+ROLE_PARTICIPANT = f"{ROLE_CALLBACK_PREFIX}participant"
 
 _conversation_handler: ConversationHandler | None = None
 
@@ -82,16 +89,8 @@ def _update_conversation_state(update: Update, new_state: object) -> None:
     _conversation_handler._update_state(new_state, key)  # type: ignore[attr-defined]
 
 USER_REGISTER = "user:register"
-USER_REMIND_HOUR = "user:remind:hour"
-USER_REMIND_DAY = "user:remind:day"
-USER_UNSUBSCRIBE = "user:unsubscribe"
-USER_CONFIRMED_PAYMENT = "user:paid"
 USER_FEEDBACK = "user:feedback"
-USER_LOCATION = "user:location"
-USER_CALENDAR = "user:calendar"
 
-REMINDER_HOUR = "hour"
-REMINDER_DAY = "day"
 TZ = ZoneInfo(TIMEZONE)
 
 
@@ -119,7 +118,7 @@ def _participant_status(chat_id: int) -> ParticipantStatus:
     row = database.get_participant(chat_id)
     if not row:
         return ParticipantStatus(registered=False, paid=False)
-    role_value = (row.get("Тип участия") or "").strip().lower()
+    role_value = format_role(row.get("Тип участия") or "")
     paid_value = (row.get("Статус оплаты") or "").strip().lower()
     paid = paid_value in {"оплачено", "оплатил", "оплатила", "paid", "yes", "да"}
     return ParticipantStatus(
@@ -130,31 +129,22 @@ def _participant_status(chat_id: int) -> ParticipantStatus:
     )
 
 
-def _build_status_text(status: ParticipantStatus) -> str:
-    if not status.registered:
-        return "🟡 Статус: вы ещё не зарегистрированы."
-    if status.paid:
-        return "🟢 Статус: участие подтверждено (оплачено)."
-    return "🟠 Статус: регистрация получена, ожидаем оплату."
-
-
 def _build_event_message(settings: dict, status: ParticipantStatus, extra: Optional[str] = None) -> str:
     ctx = get_event_context(settings)
-    welcome = (settings.get("welcome_text") or "").strip()
     lines = []
-    if welcome:
-        lines.append(welcome)
-    lines.append(f"🧠 Мероприятие: {ctx['title']}")
-    lines.append(f"📝 {ctx['description']}")
+    lines.append(f"🧠 {ctx['title']}")
     lines.append(f"📅 {ctx['local_datetime']} ({ctx['timezone']})")
-    zoom_link = settings.get("zoom_link") or ""
-    if zoom_link:
-        lines.append(f"🔗 Zoom: {zoom_link}")
-    payment = settings.get("payment_link") or ""
-    if payment:
-        lines.append(f"💳 Оплата: {payment}")
+    lines.append(f"📝 {ctx['description']}")
     lines.append("")
-    lines.append(_build_status_text(status))
+    if status.registered:
+        lines.append(f"📧 E-mail: {status.email or '—'}")
+        if status.role:
+            lines.append(f"👤 Тип участия: {status.role}")
+    else:
+        lines.append("📧 E-mail: —")
+        lines.append("👤 Тип участия: —")
+    lines.append("")
+    lines.append("Мы пришлём напоминание за 1 день и за 1 час до начала мероприятия.")
     if extra:
         lines.append("")
         lines.append(extra)
@@ -165,19 +155,7 @@ def _build_user_keyboard(status: ParticipantStatus) -> InlineKeyboardMarkup:
     keyboard: list[list[InlineKeyboardButton]] = []
     if not status.registered:
         keyboard.append([InlineKeyboardButton("✅ Зарегистрироваться", callback_data=USER_REGISTER)])
-    else:
-        keyboard.append(
-            [
-                InlineKeyboardButton("🔔 Напомнить за 1 час", callback_data=USER_REMIND_HOUR),
-                InlineKeyboardButton("⏰ Напомнить за 1 день", callback_data=USER_REMIND_DAY),
-            ]
-        )
-        keyboard.append([InlineKeyboardButton("❌ Отписаться", callback_data=USER_UNSUBSCRIBE)])
-        if not status.paid:
-            keyboard.append([InlineKeyboardButton("💳 Я оплатил(а)", callback_data=USER_CONFIRMED_PAYMENT)])
     keyboard.append([InlineKeyboardButton("📝 Оставить отзыв", callback_data=USER_FEEDBACK)])
-    keyboard.append([InlineKeyboardButton("📍 Локация/ссылка", callback_data=USER_LOCATION)])
-    keyboard.append([InlineKeyboardButton("🗓 Добавить в календарь", callback_data=USER_CALENDAR)])
     return InlineKeyboardMarkup(keyboard)
 
 
@@ -279,9 +257,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                 )
         return ConversationHandler.END
 
+    chat = update.effective_chat
+    chat_id = chat.id if chat else None
+    status = _participant_status(chat_id) if chat_id is not None else ParticipantStatus(False, False)
     await _render_user_panel(update=update, context=context)
-    context.user_data.pop("awaiting_email", None)
     context.user_data.pop("awaiting_feedback", None)
+    context.user_data.pop("pending_registration", None)
+    if chat_id is not None and not status.registered:
+        context.user_data["awaiting_email"] = True
+        await context.bot.send_message(chat_id=chat_id, text="Введи e-mail одним сообщением.")
+        return WAITING_EMAIL
+    context.user_data.pop("awaiting_email", None)
     return PANEL
 
 
@@ -292,121 +278,13 @@ async def _handle_registration(update: Update, context: ContextTypes.DEFAULT_TYP
     chat_id = update.effective_chat.id
     status = _participant_status(chat_id)
     if status.registered:
-        await _render_user_panel(update=update, context=context, status_message="Вы уже зарегистрированы.")
+        await context.bot.send_message(chat_id=chat_id, text="Вы уже зарегистрированы.")
         return PANEL
     context.user_data["awaiting_email"] = True
-    await _render_user_panel(
-        update=update,
-        context=context,
-        status_message="Отправьте, пожалуйста, ваш e-mail одним сообщением.",
-    )
+    context.user_data.pop("pending_registration", None)
+    await context.bot.send_message(chat_id=chat_id, text="Введи e-mail одним сообщением.")
     return WAITING_EMAIL
 
-
-async def _handle_reminder(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    label: str,
-) -> int:
-    query = update.callback_query
-    if query:
-        await query.answer()
-    chat_id = update.effective_chat.id
-    status = _participant_status(chat_id)
-    if not status.registered:
-        await _render_user_panel(
-            update=update,
-            context=context,
-            status_message="Сначала зарегистрируйтесь, чтобы настраивать напоминания.",
-        )
-        return PANEL
-
-    settings = load_settings()
-    event_id = str(settings.get("current_event_id") or "")
-    event_dt = _get_event_datetime(settings)
-    if not event_dt or not event_id:
-        await _render_user_panel(
-            update=update,
-            context=context,
-            status_message="Дата мероприятия пока не указана. Мы напомним позже автоматически.",
-        )
-        return PANEL
-
-    if label == REMINDER_DAY:
-        run_at = event_dt - timedelta(days=1)
-        message = "Напоминаем: до начала мероприятия остался один день!"
-    else:
-        run_at = event_dt - timedelta(hours=1)
-        message = "Через час начинается мероприятие. До встречи!"
-
-    scheduled = schedule_personal_reminder(
-        context,
-        chat_id=chat_id,
-        run_at=run_at,
-        message=message,
-        label=label,
-        event_id=event_id,
-    )
-    if not scheduled:
-        await _render_user_panel(
-            update=update,
-            context=context,
-            status_message="Это напоминание уже неактуально, время прошло.",
-        )
-        return PANEL
-    local_dt = scheduled.astimezone(TZ)
-    await _render_user_panel(
-        update=update,
-        context=context,
-        status_message=f"Личное напоминание настроено на {local_dt.strftime('%d.%m %H:%M')}.",
-    )
-    return PANEL
-
-
-async def _handle_unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    if query:
-        await query.answer()
-    chat_id = update.effective_chat.id
-    if database.unregister_participant(chat_id):
-        cancel_personal_reminder(context, chat_id, REMINDER_DAY)
-        cancel_personal_reminder(context, chat_id, REMINDER_HOUR)
-        await _render_user_panel(
-            update=update,
-            context=context,
-            status_message="Вы успешно отписались от участия.",
-        )
-    else:
-        await _render_user_panel(
-            update=update,
-            context=context,
-            status_message="Активной регистрации не найдено.",
-        )
-    return PANEL
-
-
-async def _handle_payment_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    if query:
-        await query.answer()
-    chat_id = update.effective_chat.id
-    status = _participant_status(chat_id)
-    if not status.registered:
-        await _render_user_panel(
-            update=update,
-            context=context,
-            status_message="Сначала зарегистрируйтесь, затем подтвердите оплату.",
-        )
-        return PANEL
-
-    settings = load_settings()
-    await send_paid_confirmation(context.bot, chat_id, settings=settings)
-    await _render_user_panel(
-        update=update,
-        context=context,
-        status_message="Спасибо! Мы отметили оплату и отправили подтверждение.",
-    )
-    return PANEL
 
 
 async def _handle_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -424,68 +302,14 @@ async def _handle_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     return WAITING_FEEDBACK
 
 
-async def _handle_location(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    if query:
-        await query.answer()
-    settings = load_settings()
-    location_link = settings.get("zoom_link") or settings.get("location_link")
-    if location_link:
-        await update.effective_chat.send_message(
-            f"Локация/ссылка: {location_link}", disable_web_page_preview=False
-        )
-    else:
-        await update.effective_chat.send_message("Локация будет объявлена позже.")
-    await _render_user_panel(update=update, context=context)
-    return PANEL
+def _role_selection_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton(ROLE_FREE, callback_data=ROLE_OBSERVER)],
+            [InlineKeyboardButton(ROLE_PAID, callback_data=ROLE_PARTICIPANT)],
+        ]
+    )
 
-
-def _build_ics_content(settings: dict) -> Optional[str]:
-    event_dt = _get_event_datetime(settings)
-    if not event_dt:
-        return None
-    ctx = get_event_context(settings)
-    dt_start = event_dt.astimezone(TZ)
-    dt_end = dt_start + timedelta(hours=1)
-    def _format(dt: datetime) -> str:
-        return dt.strftime("%Y%m%dT%H%M%S")
-
-    ics = [
-        "BEGIN:VCALENDAR",
-        "VERSION:2.0",
-        "PRODID:-//Psychology Webinar//EN",
-        "BEGIN:VEVENT",
-        f"UID:{dt_start.strftime('%Y%m%dT%H%M%S')}@psychology-webinar",
-        f"DTSTART;TZID={TIMEZONE}:{_format(dt_start)}",
-        f"DTEND;TZID={TIMEZONE}:{_format(dt_end)}",
-        f"SUMMARY:{ctx['title']}",
-        f"DESCRIPTION:{ctx['description']}",
-    ]
-    location = settings.get("zoom_link") or settings.get("location_link")
-    if location:
-        ics.append(f"LOCATION:{location}")
-    ics.extend(["END:VEVENT", "END:VCALENDAR"])
-    return "\n".join(ics)
-
-
-async def _handle_calendar(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    if query:
-        await query.answer()
-    settings = load_settings()
-    content = _build_ics_content(settings)
-    if not content:
-        await update.effective_chat.send_message(
-            "Дата мероприятия пока не настроена, календарь недоступен."
-        )
-    else:
-        await update.effective_chat.send_document(
-            document=content.encode("utf-8"),
-            filename="event.ics",
-            caption="Добавьте событие в ваш календарь",
-        )
-    await _render_user_panel(update=update, context=context)
-    return PANEL
 
 
 async def handle_user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -493,20 +317,8 @@ async def handle_user_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     new_state = PANEL
     if data == USER_REGISTER:
         new_state = await _handle_registration(update, context)
-    elif data == USER_REMIND_DAY:
-        new_state = await _handle_reminder(update, context, REMINDER_DAY)
-    elif data == USER_REMIND_HOUR:
-        new_state = await _handle_reminder(update, context, REMINDER_HOUR)
-    elif data == USER_UNSUBSCRIBE:
-        new_state = await _handle_unsubscribe(update, context)
-    elif data == USER_CONFIRMED_PAYMENT:
-        new_state = await _handle_payment_confirmation(update, context)
     elif data == USER_FEEDBACK:
         new_state = await _handle_feedback(update, context)
-    elif data == USER_LOCATION:
-        new_state = await _handle_location(update, context)
-    elif data == USER_CALENDAR:
-        new_state = await _handle_calendar(update, context)
     else:
         if update.callback_query:
             await update.callback_query.answer()
@@ -522,35 +334,92 @@ async def handle_email(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 
     chat_id = update.effective_chat.id
     user = update.effective_user
+    pending = context.user_data.setdefault("pending_registration", {})
+    pending.update(
+        {
+            "email": email,
+            "chat_id": chat_id,
+            "name": (user.full_name or "") if user else "",
+            "username": f"@{user.username}" if user and user.username else "",
+        }
+    )
+    context.user_data["awaiting_email"] = False
+    await update.message.reply_text(
+        "Выбери тип участия:", reply_markup=_role_selection_keyboard()
+    )
+    return WAITING_ROLE
+
+
+async def handle_role_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    if not query:
+        return WAITING_ROLE
+    await query.answer()
+    choice = query.data or ""
+    if not choice.startswith(ROLE_CALLBACK_PREFIX):
+        return WAITING_ROLE
+
+    chat = update.effective_chat
+    chat_id = chat.id if chat else context.user_data.get("pending_registration", {}).get("chat_id")
+    pending = context.user_data.get("pending_registration") or {}
+    email = pending.get("email")
+    if chat_id is None or not email:
+        await query.edit_message_text("Регистрация устарела. Нажми «Зарегистрироваться» ещё раз.")
+        context.user_data.pop("pending_registration", None)
+        context.user_data.pop("awaiting_email", None)
+        return PANEL
+
+    role_label = ROLE_FREE if choice == ROLE_OBSERVER else ROLE_PAID
     participant = database.Participant(
-        name=(user.full_name or "") if user else "",
-        username=f"@{user.username}" if user and user.username else "",
+        name=pending.get("name", ""),
+        username=pending.get("username", ""),
         chat_id=chat_id,
         email=email,
+        role=role_label,
     )
     try:
         database.register_participant(participant)
     except RuntimeError:
-        await update.message.reply_text(
-            "Регистрация временно недоступна. Попробуйте позже."
-        )
+        await query.edit_message_text("Регистрация временно недоступна. Попробуй позже.")
         await _refresh_panel_from_state(
             context=context,
             chat_id=chat_id,
-            status_message="Не удалось зарегистрироваться. Попробуйте позже.",
+            status_message="Не удалось сохранить регистрацию. Попробуйте позже.",
         )
+        context.user_data.pop("pending_registration", None)
+        context.user_data.pop("awaiting_email", None)
         return PANEL
 
+    await query.edit_message_text(f"✅ Тип участия: {role_label}")
     settings = load_settings()
-    confirmation = build_free_confirmation(settings)
-    await update.message.reply_text(confirmation)
+    if role_label == ROLE_PAID:
+        confirmation = build_paid_pending_confirmation(settings)
+        status_message = "Мы записали ваши данные. Ссылку на оплату отправили сообщением."
+    else:
+        confirmation = build_free_confirmation(settings)
+        status_message = "Вы успешно зарегистрированы!"
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=confirmation,
+        disable_web_page_preview=True,
+    )
     await _refresh_panel_from_state(
         context=context,
         chat_id=chat_id,
-        status_message="Вы успешно зарегистрированы!",
+        status_message=status_message,
     )
+    context.user_data.pop("pending_registration", None)
     context.user_data.pop("awaiting_email", None)
     return PANEL
+
+
+async def handle_role_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text(
+        "Пожалуйста, выбери тип участия кнопкой ниже.",
+        reply_markup=_role_selection_keyboard(),
+    )
+    return WAITING_ROLE
 
 
 async def handle_feedback_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -576,6 +445,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text("Действие отменено.")
     context.user_data.pop("awaiting_email", None)
     context.user_data.pop("awaiting_feedback", None)
+    context.user_data.pop("pending_registration", None)
     await _refresh_panel_from_state(context=context, chat_id=update.effective_chat.id)
     return PANEL
 
@@ -600,6 +470,10 @@ def build_conversation_handler() -> ConversationHandler:
         states={
             PANEL: [],
             WAITING_EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_email)],
+            WAITING_ROLE: [
+                CallbackQueryHandler(handle_role_selection, pattern=rf"^{ROLE_CALLBACK_PREFIX}"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_role_text),
+            ],
             WAITING_FEEDBACK: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_feedback_text)
             ],
