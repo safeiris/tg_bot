@@ -13,6 +13,7 @@ import database
 from config import TIMEZONE, load_settings
 from events import classify_status, get_event
 from message_templates import get_event_context
+from reminders import cancel_event_user_reminders, replan_event_user_reminders
 
 scheduler = AsyncIOScheduler(timezone=ZoneInfo(TIMEZONE))
 
@@ -82,6 +83,7 @@ async def _send_feedback_request(application, event_id: str, text: str) -> None:
             continue
         waiting_feedback.add(chat_id_int)
         await application.bot.send_message(chat_id=chat_id_int, text=text)
+    cancel_event_user_reminders(application, event_id)
 
 
 def _clear_event_jobs(event_id: str) -> None:
@@ -113,10 +115,34 @@ def schedule_all_reminders(application) -> None:
     event_id = settings.get("current_event_id")
     if not event_iso or not event_id:
         scheduler.remove_all_jobs()
+        cancel_event_user_reminders(application, None)
         return
 
-    event_dt = datetime.fromisoformat(event_iso)
-    _clear_event_jobs(event_id)
+    event_id_str = str(event_id)
+    try:
+        event_dt = datetime.fromisoformat(str(event_iso))
+    except ValueError:
+        scheduler.remove_all_jobs()
+        cancel_event_user_reminders(application, event_id_str)
+        return
+    if event_dt.tzinfo is None:
+        event_dt = event_dt.replace(tzinfo=ZoneInfo(TIMEZONE))
+    else:
+        event_dt = event_dt.astimezone(ZoneInfo(TIMEZONE))
+
+    event = get_event(event_id_str)
+    if event and classify_status(event) == "cancelled":
+        cancel_scheduled_reminders(event_id_str)
+        cancel_event_user_reminders(application, event_id_str)
+        return
+
+    now = datetime.now(event_dt.tzinfo or ZoneInfo(TIMEZONE))
+    if event_dt <= now:
+        cancel_scheduled_reminders(event_id_str)
+        cancel_event_user_reminders(application, event_id_str)
+        return
+
+    _clear_event_jobs(event_id_str)
 
     day_before = event_dt - timedelta(days=1)
     hour_before = event_dt - timedelta(hours=1)
@@ -125,29 +151,31 @@ def schedule_all_reminders(application) -> None:
     text_day_after = "Спасибо, что были с нами 💕 Поделитесь впечатлениями?"
 
     _schedule_job(
-        f"{event_id}::day_before",
+        f"{event_id_str}::day_before",
         day_before,
         _send_timed_reminder,
         application,
-        event_id,
+        event_id_str,
         "day",
     )
     _schedule_job(
-        f"{event_id}::hour_before",
+        f"{event_id_str}::hour_before",
         hour_before,
         _send_timed_reminder,
         application,
-        event_id,
+        event_id_str,
         "hour",
     )
     _schedule_job(
-        f"{event_id}::feedback",
+        f"{event_id_str}::feedback",
         day_after,
         _send_feedback_request,
         application,
-        event_id,
+        event_id_str,
         text_day_after,
     )
+
+    replan_event_user_reminders(application, event_id_str)
 
 
 def ensure_scheduler_started() -> None:

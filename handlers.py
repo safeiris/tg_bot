@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import Optional
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import TelegramError
 from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
@@ -25,6 +26,7 @@ from message_templates import (
     build_paid_pending_confirmation,
     get_event_context,
 )
+from reminders import plan_user_event_reminders
 from zoneinfo import ZoneInfo
 
 from admin_panel import show_main_menu
@@ -103,6 +105,35 @@ class ParticipantStatus:
     email: str = ""
 
 
+def _keyboard_signature(markup: InlineKeyboardMarkup) -> tuple[tuple[tuple[str, str | None, str | None], ...], ...]:
+    if not markup or not getattr(markup, "inline_keyboard", None):
+        return ()
+    signature: list[tuple[tuple[str, str | None, str | None], ...]] = []
+    for row in markup.inline_keyboard:
+        signature.append(tuple((button.text, button.callback_data, button.url) for button in row))
+    return tuple(signature)
+
+
+def _panel_signature(text: str, markup: InlineKeyboardMarkup) -> tuple[str, tuple[tuple[tuple[str, str | None, str | None], ...], ...]]:
+    return text, _keyboard_signature(markup)
+
+
+def _store_panel_state(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    message_id: int,
+    signature: tuple[str, tuple[tuple[tuple[str, str | None, str | None], ...], ...]],
+) -> None:
+    context.user_data["last_user_panel_msg_id"] = message_id
+    context.user_data["last_user_panel_signature"] = signature
+
+
+def _reset_user_input_state(context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.pop("awaiting_email", None)
+    context.user_data.pop("awaiting_feedback", None)
+    context.user_data.pop("pending_registration", None)
+
+
 def _get_event_datetime(settings: Optional[dict] = None) -> Optional[datetime]:
     if settings is None:
         settings = load_settings()
@@ -174,28 +205,42 @@ async def _render_user_panel(
     status = _participant_status(chat_id)
     text = _build_event_message(settings, status, status_message)
     keyboard = _build_user_keyboard(status)
-    if update.callback_query and update.callback_query.message:
-        await update.callback_query.message.edit_text(
-            text,
-            reply_markup=keyboard,
-            disable_web_page_preview=True,
-        )
-        context.user_data["panel_message_id"] = update.callback_query.message.message_id
-    elif update.message:
+    signature = _panel_signature(text, keyboard)
+    query = update.callback_query
+    message = query.message if query else None
+    stored_id = context.user_data.get("last_user_panel_msg_id")
+    if message and message.chat_id == chat_id:
+        if stored_id and stored_id != message.message_id:
+            message = None
+        else:
+            if context.user_data.get("last_user_panel_signature") == signature:
+                _store_panel_state(context, message_id=message.message_id, signature=signature)
+                return
+            try:
+                await message.edit_text(
+                    text,
+                    reply_markup=keyboard,
+                    disable_web_page_preview=True,
+                )
+                _store_panel_state(context, message_id=message.message_id, signature=signature)
+                return
+            except TelegramError:
+                message = None
+    if update.message and not message:
         sent = await update.message.reply_text(
             text,
             reply_markup=keyboard,
             disable_web_page_preview=True,
         )
-        context.user_data["panel_message_id"] = sent.message_id
-    else:
-        sent = await context.bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            reply_markup=keyboard,
-            disable_web_page_preview=True,
-        )
-        context.user_data["panel_message_id"] = sent.message_id
+        _store_panel_state(context, message_id=sent.message_id, signature=signature)
+        return
+    sent = await context.bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        reply_markup=keyboard,
+        disable_web_page_preview=True,
+    )
+    _store_panel_state(context, message_id=sent.message_id, signature=signature)
 
 
 async def _refresh_panel_from_state(
@@ -204,11 +249,15 @@ async def _refresh_panel_from_state(
     chat_id: int,
     status_message: Optional[str] = None,
 ) -> None:
-    message_id = context.user_data.get("panel_message_id")
     settings = load_settings()
     status = _participant_status(chat_id)
     text = _build_event_message(settings, status, status_message)
     keyboard = _build_user_keyboard(status)
+    signature = _panel_signature(text, keyboard)
+    message_id = context.user_data.get("last_user_panel_msg_id")
+    if message_id and context.user_data.get("last_user_panel_signature") == signature:
+        _store_panel_state(context, message_id=message_id, signature=signature)
+        return
     if message_id:
         try:
             await context.bot.edit_message_text(
@@ -218,15 +267,17 @@ async def _refresh_panel_from_state(
                 reply_markup=keyboard,
                 disable_web_page_preview=True,
             )
+            _store_panel_state(context, message_id=message_id, signature=signature)
             return
-        except Exception:
+        except TelegramError:
             pass
-    await context.bot.send_message(
+    sent = await context.bot.send_message(
         chat_id=chat_id,
         text=text,
         reply_markup=keyboard,
         disable_web_page_preview=True,
     )
+    _store_panel_state(context, message_id=sent.message_id, signature=signature)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -273,9 +324,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def _handle_registration(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    if query:
-        await query.answer()
     chat_id = update.effective_chat.id
     status = _participant_status(chat_id)
     if status.registered:
@@ -289,9 +337,6 @@ async def _handle_registration(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def _handle_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    if query:
-        await query.answer()
     context.user_data["awaiting_feedback"] = True
     await _render_user_panel(
         update=update,
@@ -314,15 +359,19 @@ def _role_selection_keyboard() -> InlineKeyboardMarkup:
 
 
 async def handle_user_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    data = update.callback_query.data if update.callback_query else ""
+    query = update.callback_query
+    if query:
+        try:
+            await query.answer()
+        except Exception:
+            logger.debug("Failed to answer user callback", exc_info=True)
+    _reset_user_input_state(context)
+    data = query.data if query else ""
     new_state = PANEL
     if data == USER_REGISTER:
         new_state = await _handle_registration(update, context)
     elif data == USER_FEEDBACK:
         new_state = await _handle_feedback(update, context)
-    else:
-        if update.callback_query:
-            await update.callback_query.answer()
     _update_conversation_state(update, new_state)
     return new_state
 
@@ -399,6 +448,13 @@ async def handle_role_selection(update: Update, context: ContextTypes.DEFAULT_TY
     else:
         confirmation = build_free_confirmation(settings)
         status_message = "Вы успешно зарегистрированы!"
+
+    event_id = settings.get("current_event_id")
+    if event_id:
+        try:
+            plan_user_event_reminders(context, chat_id=chat_id, event_id=str(event_id))
+        except Exception:
+            logger.exception("Failed to schedule personal reminders for %s", chat_id)
 
     await context.bot.send_message(
         chat_id=chat_id,
