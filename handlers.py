@@ -112,6 +112,8 @@ RESTART_BUTTON_PATTERN = rf"^{re.escape(RESTART_BUTTON_TEXT)}$"
 USER_PAID_CONFIRMED = "user:paid_confirm"
 
 TZ = ZoneInfo(TIMEZONE)
+EMAIL_PROMPT_DEDUP_WINDOW = 3.0
+RESTART_GUARD_WINDOW = 2.0
 
 
 @dataclass
@@ -171,8 +173,13 @@ def _store_panel_state(
     context.user_data["last_user_panel_signature"] = signature
 
 
-def _reset_user_input_state(context: ContextTypes.DEFAULT_TYPE) -> None:
+def _clear_email_prompt_state(context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.pop("awaiting_email", None)
+    context.user_data.pop("email_prompt_ts", None)
+
+
+def _reset_user_input_state(context: ContextTypes.DEFAULT_TYPE) -> None:
+    _clear_email_prompt_state(context)
     context.user_data.pop("awaiting_feedback", None)
     context.user_data.pop("pending_registration", None)
 
@@ -180,6 +187,100 @@ def _reset_user_input_state(context: ContextTypes.DEFAULT_TYPE) -> None:
 def _clear_user_panel_cache(context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.pop("last_user_panel_msg_id", None)
     context.user_data.pop("last_user_panel_signature", None)
+
+
+def _clear_restart_guard(context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.pop("restart_in_progress", None)
+
+
+def _restart_guard_active(context: ContextTypes.DEFAULT_TYPE, now_ts: float) -> bool:
+    guard_raw = context.user_data.get("restart_in_progress")
+    if isinstance(guard_raw, (int, float)):
+        guard_ts = float(guard_raw)
+        if now_ts - guard_ts < RESTART_GUARD_WINDOW:
+            return True
+    _clear_restart_guard(context)
+    return False
+
+
+def _current_ts() -> float:
+    return datetime.now(tz=TZ).timestamp()
+
+
+def _email_prompt_message_id(context: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
+    prompts = context.user_data.get("last_prompts")
+    if not isinstance(prompts, dict):
+        context.user_data["last_prompts"] = {}
+        return None
+    message_id = prompts.get("email_prompt_msg_id")
+    if isinstance(message_id, int):
+        return message_id
+    if isinstance(message_id, str) and message_id.isdigit():
+        return int(message_id)
+    return None
+
+
+def _store_email_prompt_message_id(
+    context: ContextTypes.DEFAULT_TYPE, message_id: int
+) -> None:
+    prompts = context.user_data.get("last_prompts")
+    if not isinstance(prompts, dict):
+        prompts = {}
+        context.user_data["last_prompts"] = prompts
+    prompts["email_prompt_msg_id"] = message_id
+
+
+async def prompt_user_email(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    reason: str = "",
+) -> int:
+    chat = update.effective_chat
+    if chat is None:
+        return WAITING_EMAIL
+
+    chat_id = chat.id
+    reason = reason or "unknown"
+    logger.info("PROMPT_EMAIL start reason=%s", reason)
+
+    user_data = context.user_data
+    now_ts = _current_ts()
+    awaiting = bool(user_data.get("awaiting_email"))
+    last_ts_raw = user_data.get("email_prompt_ts")
+    last_ts = float(last_ts_raw) if isinstance(last_ts_raw, (int, float)) else None
+    if awaiting and last_ts is not None and now_ts - last_ts < EMAIL_PROMPT_DEDUP_WINDOW:
+        logger.info("PROMPT_EMAIL dedup(noop) reason=%s", reason)
+        return WAITING_EMAIL
+
+    user_data["awaiting_email"] = True
+    user_data["email_prompt_ts"] = now_ts
+
+    message_id = _email_prompt_message_id(context)
+    text = "Введи e-mail одним сообщением."
+    reply_markup = _build_restart_reply_keyboard()
+    if message_id is not None:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=message_id,
+                text=text,
+                reply_markup=reply_markup,
+            )
+        except TelegramError:
+            message_id = None
+        else:
+            _store_email_prompt_message_id(context, message_id)
+            logger.info("PROMPT_EMAIL edit reason=%s", reason)
+            return WAITING_EMAIL
+
+    sent = await context.bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        reply_markup=reply_markup,
+    )
+    _store_email_prompt_message_id(context, sent.message_id)
+    logger.info("PROMPT_EMAIL send reason=%s", reason)
+    return WAITING_EMAIL
 
 
 def _clear_global_feedback_flag(
@@ -420,8 +521,11 @@ async def _enter_user_flow(
     if chat is None:
         return ConversationHandler.END
     chat_id = chat.id
+    restart_guard = context.user_data.get("restart_in_progress") if force_registration else None
     if force_registration:
         context.user_data.clear()
+        if restart_guard is not None:
+            context.user_data["restart_in_progress"] = restart_guard
     await _ensure_restart_reply_keyboard(context, chat_id, force=force_registration)
     _activate_event_payload(context, payload)
     _clear_global_feedback_flag(context, chat_id)
@@ -444,6 +548,7 @@ async def _enter_user_flow(
             status = _participant_status(chat_id)
         panel_status = ParticipantStatus(registered=False, paid=False)
         status_message = "Начнём регистрацию заново."
+    _clear_restart_guard(context)
     await _render_user_panel(
         update=update,
         context=context,
@@ -451,15 +556,7 @@ async def _enter_user_flow(
         status_message=status_message,
         fresh_panel=fresh_panel,
     )
-    if not panel_status.registered:
-        context.user_data["awaiting_email"] = True
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text="Введи e-mail одним сообщением.",
-            reply_markup=_build_restart_reply_keyboard(),
-        )
-        return WAITING_EMAIL
-    context.user_data.pop("awaiting_email", None)
+    _clear_email_prompt_state(context)
     return PANEL
 
 
@@ -532,14 +629,8 @@ async def _handle_registration(update: Update, context: ContextTypes.DEFAULT_TYP
             reply_markup=_build_restart_reply_keyboard(),
         )
         return PANEL
-    context.user_data["awaiting_email"] = True
     context.user_data.pop("pending_registration", None)
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text="Введи e-mail одним сообщением.",
-        reply_markup=_build_restart_reply_keyboard(),
-    )
-    return WAITING_EMAIL
+    return await prompt_user_email(update, context, reason="register_button")
 
 
 
@@ -588,12 +679,20 @@ async def handle_user_callback(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def _handle_user_restart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    return await _enter_user_flow(
-        update,
-        context,
-        fresh_panel=True,
-        force_registration=True,
-    )
+    now_ts = _current_ts()
+    if _restart_guard_active(context, now_ts):
+        logger.debug("Restart ignored due to in-progress guard")
+        return PANEL
+    context.user_data["restart_in_progress"] = now_ts
+    try:
+        return await _enter_user_flow(
+            update,
+            context,
+            fresh_panel=True,
+            force_registration=True,
+        )
+    finally:
+        _clear_restart_guard(context)
 
 
 async def restart_via_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -683,6 +782,7 @@ async def handle_email(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         }
     )
     context.user_data["awaiting_email"] = False
+    context.user_data.pop("email_prompt_ts", None)
     await update.message.reply_text(
         "E-mail записали ✅",
         reply_markup=_build_restart_reply_keyboard(),
@@ -709,7 +809,7 @@ async def handle_role_selection(update: Update, context: ContextTypes.DEFAULT_TY
     if chat_id is None or not email:
         await query.edit_message_text("Регистрация устарела. Нажми «Зарегистрироваться» ещё раз.")
         context.user_data.pop("pending_registration", None)
-        context.user_data.pop("awaiting_email", None)
+        _clear_email_prompt_state(context)
         return PANEL
 
     role_label = ROLE_FREE if choice == ROLE_OBSERVER else ROLE_PAID
@@ -730,7 +830,7 @@ async def handle_role_selection(update: Update, context: ContextTypes.DEFAULT_TY
             status_message="Не удалось сохранить регистрацию. Попробуйте позже.",
         )
         context.user_data.pop("pending_registration", None)
-        context.user_data.pop("awaiting_email", None)
+        _clear_email_prompt_state(context)
         return PANEL
 
     await query.edit_message_text(f"✅ Тип участия: {role_label}")
@@ -773,7 +873,7 @@ async def handle_role_selection(update: Update, context: ContextTypes.DEFAULT_TY
         status_message=status_message,
     )
     context.user_data.pop("pending_registration", None)
-    context.user_data.pop("awaiting_email", None)
+    _clear_email_prompt_state(context)
     return PANEL
 
 
@@ -815,7 +915,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         "Действие отменено.",
         reply_markup=_build_restart_reply_keyboard(),
     )
-    context.user_data.pop("awaiting_email", None)
+    _clear_email_prompt_state(context)
     context.user_data.pop("awaiting_feedback", None)
     context.user_data.pop("pending_registration", None)
     await _refresh_panel_from_state(context=context, chat_id=update.effective_chat.id)
