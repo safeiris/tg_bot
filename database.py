@@ -166,6 +166,28 @@ def list_event_sheets() -> List[Dict[str, object]]:
     return sheets
 
 
+def list_sheet_tabs() -> set[str]:
+    """Return the set of available sheet/tab names in the spreadsheet."""
+    spreadsheet = _open_spreadsheet()
+    try:
+        worksheets = spreadsheet.worksheets()
+    except gspread.exceptions.GSpreadException:
+        raise
+    return {worksheet.title for worksheet in worksheets}
+
+
+def sheet_exists(sheet_name: str) -> bool:
+    """Check whether a worksheet with the given name exists."""
+    if not sheet_name:
+        return False
+    spreadsheet = _open_spreadsheet()
+    try:
+        spreadsheet.worksheet(sheet_name)
+    except gspread.exceptions.WorksheetNotFound:
+        return False
+    return True
+
+
 def get_current_worksheet() -> gspread.Worksheet:
     settings = load_settings()
     sheet_name = settings.get("current_event_sheet_name")

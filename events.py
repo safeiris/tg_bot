@@ -206,7 +206,7 @@ def _sorted_events(events: List[Event]) -> List[Event]:
     ordered = list(events)
 
     def sort_key(event: Event) -> Tuple[int, float, str]:
-        order = {"active": 0, "past": 1, "cancelled": 2}.get(
+        order = {"active": 0, "past": 1, "cancelled": 2, "removed": 3}.get(
             classify_status(event), 3
         )
         dt = event.parsed_datetime
@@ -394,7 +394,7 @@ def _event_local_datetime(event: Event) -> Optional[datetime]:
 def _auto_update_status(events: List[Event], current_event_id: Optional[str]) -> None:
     changed = False
     for event in events:
-        if event.status == "cancelled":
+        if event.status in {"cancelled", "removed"}:
             continue
         local_dt = _event_local_datetime(event)
         if local_dt is None:
@@ -410,6 +410,8 @@ def _auto_update_status(events: List[Event], current_event_id: Optional[str]) ->
 
 
 def classify_status(event: Event) -> str:
+    if event.status == "removed":
+        return "removed"
     if event.status == "cancelled":
         return "cancelled"
     local_dt = _event_local_datetime(event)
@@ -426,6 +428,107 @@ def has_active_event() -> bool:
         if classify_status(event) == "active":
             return True
     return False
+
+
+def _event_sheet_candidates(event: Event) -> List[str]:
+    candidates = [event.sheet_name, event.event_id]
+    return [name for name in candidates if name]
+
+
+def sync_events_with_sheets() -> None:
+    """Reconcile stored events with actual Google Sheets tabs."""
+    try:
+        tabs = database.list_sheet_tabs()
+    except Exception as exc:  # pragma: no cover - network errors
+        logger.warning("Failed to fetch sheet tabs: %s", exc)
+        return
+
+    events, stored_current = load_events()
+    current_id = stored_current
+    changed = False
+    now_iso = datetime.now(TZ).isoformat()
+    for idx, event in enumerate(events):
+        if classify_status(event) == "removed":
+            continue
+        sheet_names = _event_sheet_candidates(event)
+        if any(name in tabs for name in sheet_names):
+            continue
+        event.status = "removed"
+        event.updated_at = now_iso
+        events[idx] = event
+        changed = True
+        if current_id == event.event_id:
+            current_id = None
+    if not changed:
+        return
+    _store_events(events, current_id)
+    if current_id != stored_current:
+        set_current_event(current_id)
+    else:
+        _mark_index_stale()
+
+
+def list_events_for_admin() -> Dict[str, List[Event]]:
+    """Return grouped events for the admin list view."""
+    events, current_id = load_events()
+    _auto_update_status(events, current_id)
+    try:
+        tabs = database.list_sheet_tabs()
+        tabs_fetched = True
+    except Exception as exc:  # pragma: no cover - network errors
+        logger.warning("Failed to fetch sheet tabs for listing: %s", exc)
+        tabs = set()
+        tabs_fetched = False
+
+    active_future: List[Event] = []
+    cancelled: List[Event] = []
+
+    for event in events:
+        status = classify_status(event)
+        if status in {"removed", "past"}:
+            continue
+        sheet_names = _event_sheet_candidates(event)
+        has_sheet = False
+        if tabs_fetched:
+            has_sheet = any(name in tabs for name in sheet_names)
+        else:
+            for name in sheet_names:
+                try:
+                    if database.sheet_exists(name):
+                        has_sheet = True
+                        break
+                except Exception as exc:  # pragma: no cover - network errors
+                    logger.warning("Failed to check sheet existence for %s: %s", name, exc)
+                    has_sheet = False
+                    break
+        if not has_sheet:
+            continue
+        if status == "active":
+            local_dt = _event_local_datetime(event)
+            if local_dt is None:
+                continue
+            now_local = datetime.now(local_dt.tzinfo)
+            if local_dt > now_local:
+                active_future.append(event)
+        elif status == "cancelled":
+            cancelled.append(event)
+
+    def sort_key_future(ev: Event) -> datetime:
+        dt = _event_local_datetime(ev)
+        if dt is None:
+            return datetime.max.replace(tzinfo=TZ)
+        return dt
+
+    def sort_key_cancelled(ev: Event) -> datetime:
+        dt = _event_local_datetime(ev)
+        if dt is None:
+            return datetime.min.replace(tzinfo=TZ)
+        return dt
+
+    active_future.sort(key=sort_key_future)
+    cancelled.sort(key=sort_key_cancelled, reverse=True)
+
+    return {"active_future": active_future, "cancelled": cancelled}
 
 
 def get_active_event() -> Optional[Event]:

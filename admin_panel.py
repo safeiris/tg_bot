@@ -21,15 +21,15 @@ from events import (
     classify_status,
     create_event,
     events_bootstrap,
-    events_refresh_if_stale,
     get_active_event,
     get_current_event,
     get_current_event_id,
     get_event,
-    get_events_page,
     has_active_event,
+    list_events_for_admin,
     open_sheet_url,
     set_current_event,
+    sync_events_with_sheets,
     update_event,
 )
 from scheduler import (
@@ -39,7 +39,6 @@ from scheduler import (
 )
 
 TZ = ZoneInfo(TIMEZONE)
-PAGE_SIZE = 5
 WIZARD_STEP_TITLE = "title"
 WIZARD_STEP_DATETIME = "datetime"
 WIZARD_STEP_ZOOM = "zoom"
@@ -52,6 +51,10 @@ ACTIVE_EVENT_WARNING = (
 )
 
 logger = logging.getLogger(__name__)
+
+
+REMOVED_SHEET_MESSAGE = "⚠️ Лист участников удалён. Событие скрыто из списка."
+PAST_EVENT_MESSAGE = "⚠️ Это мероприятие уже прошло."
 
 
 def _add_home_button(rows: List[List[InlineKeyboardButton]]) -> List[List[InlineKeyboardButton]]:
@@ -309,9 +312,11 @@ def _format_event_card(event: Optional[Event], status_message: Optional[str] = N
     return "\n".join(lines)
 
 
-def _main_menu_keyboard(active_event: Optional[Event]) -> InlineKeyboardMarkup:
+def _main_menu_keyboard(
+    active_event: Optional[Event], *, has_active_future: bool
+) -> InlineKeyboardMarkup:
     rows: List[List[InlineKeyboardButton]] = []
-    if active_event:
+    if has_active_future and active_event:
         rows.append([InlineKeyboardButton("🛠 Управление текущим", callback_data="admin:menu:manage")])
     else:
         rows.append([InlineKeyboardButton("🆕 Новое мероприятие", callback_data="admin:menu:new")])
@@ -327,10 +332,20 @@ async def _show_main_menu(
     *,
     status_message: Optional[str] = None,
 ) -> None:
+    sync_events_with_sheets()
+    grouped = list_events_for_admin()
+    active_future = grouped.get("active_future", [])
     active_event = get_active_event()
+    if not active_event and active_future:
+        active_event = active_future[0]
     event = active_event or get_current_event()
     text = _format_event_card(event, status_message)
-    await _send_panel(update, context, text, _main_menu_keyboard(active_event))
+    await _send_panel(
+        update,
+        context,
+        text,
+        _main_menu_keyboard(active_event, has_active_future=bool(active_future)),
+    )
 
 
 async def show_main_menu(
@@ -365,47 +380,38 @@ def _list_row(event: Event) -> str:
     return f"{html.escape(event.title or 'Без названия')} — {html.escape(dt)}{suffix}"
 
 
-def _list_keyboard(
-    events: List[Event],
-    page: int,
-    total_pages: int,
+def _event_list_keyboard(
+    active_future: List[Event], cancelled: List[Event]
 ) -> InlineKeyboardMarkup:
     rows: List[List[InlineKeyboardButton]] = []
-    if events:
-        for event in events:
-            rows.append(
-                [
-                    InlineKeyboardButton(
-                        event.event_id, callback_data=f"admin:list:pick:{event.event_id}"
-                    )
-                ]
-            )
-    else:
-        rows.append([InlineKeyboardButton("🆕 Новое", callback_data="admin:menu:new")])
-    if events and total_pages > 1:
-        prev_page = max(1, page - 1)
-        next_page = min(total_pages, page + 1)
+    selectable_events = list(active_future) + list(cancelled)
+    for event in selectable_events:
         rows.append(
             [
                 InlineKeyboardButton(
-                    "◀️ Назад",
-                    callback_data=(
-                        f"admin:list:page:{prev_page}" if page > 1 else f"admin:list:page:{page}"
-                    ),
-                ),
-                InlineKeyboardButton(
-                    f"Стр. {page}/{total_pages}", callback_data="admin:list:page:noop"
-                ),
-                InlineKeyboardButton(
-                    "Вперёд ▶️",
-                    callback_data=(
-                        f"admin:list:page:{next_page}" if page < total_pages else f"admin:list:page:{page}"
-                    ),
-                ),
+                    event.event_id, callback_data=f"admin:list:pick:{event.event_id}"
+                )
             ]
         )
+    if not active_future:
+        rows.append([InlineKeyboardButton("🆕 Новое мероприятие", callback_data="admin:menu:new")])
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="admin:list:back")])
     return InlineKeyboardMarkup(_add_home_button(rows))
+
+
+def _event_has_sheet(event: Event) -> bool:
+    names: List[str] = []
+    for name in (event.sheet_name, event.event_id):
+        if name and name not in names:
+            names.append(name)
+    for name in names:
+        try:
+            if database.sheet_exists(name):
+                return True
+        except Exception as exc:  # pragma: no cover - network errors
+            logger.warning("Failed to verify sheet %s: %s", name, exc)
+            return False
+    return False
 
 
 async def _show_event_list(
@@ -415,23 +421,28 @@ async def _show_event_list(
     page: int = 1,
     status_message: Optional[str] = None,
 ) -> None:
-    bot_data = context.application.bot_data if context.application else None
-    events_refresh_if_stale(bot_data=bot_data)
-    events, total_pages, total, actual_page = get_events_page(
-        page, PAGE_SIZE, bot_data=bot_data
-    )
-    if events:
-        lines = ["📅 Ваши мероприятия"]
-        for idx, event in enumerate(events, start=1):
-            lines.append(f"{idx}) {_list_row(event)}")
+    sync_events_with_sheets()
+    grouped = list_events_for_admin()
+    active_future = grouped.get("active_future", [])
+    cancelled = grouped.get("cancelled", [])
+
+    lines = ["📅 Ваши мероприятия", "", "🟢 Предстоящие"]
+    if active_future:
+        for event in active_future:
+            lines.append(f"• {_list_row(event)}")
     else:
-        lines = ["📅 Ваши мероприятия", "Пока событий нет. Создайте новое."]
+        lines.append("Нет предстоящих мероприятий")
+    if cancelled:
+        lines.append("")
+        lines.append("🟥 Отменённые")
+        for event in cancelled:
+            lines.append(f"• {_list_row(event)}")
     if status_message:
         lines.append("")
         lines.append(status_message)
     text = "\n".join(lines)
-    keyboard = _list_keyboard(events, actual_page, total_pages)
-    _replace_top(context, "list", page=actual_page)
+    keyboard = _event_list_keyboard(active_future, cancelled)
+    _replace_top(context, "list")
     await _send_panel(update, context, text, keyboard)
 
 
@@ -687,9 +698,21 @@ async def _show_event_menu(
     *,
     status_message: Optional[str] = None,
 ) -> None:
+    sync_events_with_sheets()
     event = get_event(event_id)
     if not event:
-        await _show_event_list(update, context, page=1, status_message="Событие не найдено.")
+        await _show_event_list(update, context, status_message="Событие не найдено.")
+        return
+    status = classify_status(event)
+    if status == "removed":
+        await _show_event_list(update, context, status_message=REMOVED_SHEET_MESSAGE)
+        return
+    if status == "past":
+        await _show_event_list(update, context, status_message=PAST_EVENT_MESSAGE)
+        return
+    if not _event_has_sheet(event):
+        sync_events_with_sheets()
+        await _show_event_list(update, context, status_message=REMOVED_SHEET_MESSAGE)
         return
     _replace_top(context, "event", event_id=event_id)
     text = _format_event_detail(event, status_message)
@@ -703,7 +726,7 @@ async def _show_cancel_confirmation(
 ) -> None:
     event = get_event(event_id)
     if not event:
-        await _show_event_list(update, context, page=1, status_message="Событие не найдено.")
+        await _show_event_list(update, context, status_message="Событие не найдено.")
         return
     question = f"Отменить мероприятие «{html.escape(event.title or '—')}»?"
     keyboard = InlineKeyboardMarkup(
@@ -848,15 +871,26 @@ async def _handle_event_callback(
         answered = True
     if action == "back":
         _pop_entry(context)
-        await _show_event_list(update, context, page=1)
+        await _show_event_list(update, context)
         return
+    sync_events_with_sheets()
     event = get_event(event_id)
     if not event:
-        await _show_event_list(update, context, page=1, status_message="Событие не найдено.")
+        await _show_event_list(update, context, status_message="Событие не найдено.")
         return
     status = classify_status(event)
+    if status == "removed":
+        await _show_event_list(update, context, status_message=REMOVED_SHEET_MESSAGE)
+        return
+    if status == "past":
+        await _show_event_list(update, context, status_message=PAST_EVENT_MESSAGE)
+        return
+    if not _event_has_sheet(event):
+        sync_events_with_sheets()
+        await _show_event_list(update, context, status_message=REMOVED_SHEET_MESSAGE)
+        return
     editable = status == "active"
-    view_only_message = "⚠️ Это мероприятие уже прошло.\nЕго можно только просмотреть 💗"
+    view_only_message = "⚠️ Это мероприятие нельзя редактировать."
     if action == "edit_title":
         if not editable:
             await _send_prompt_message(update, context, view_only_message)
@@ -1037,8 +1071,8 @@ async def _handle_menu_callback(
             return
         if data == "admin:menu:list":
             _clear_await(context)
-            _push_entry(context, "list", page=1)
-            await _show_event_list(update, context, page=1)
+            _push_entry(context, "list")
+            await _show_event_list(update, context)
             return
         if data == "admin:menu:manage":
             active = get_active_event()
@@ -1116,42 +1150,6 @@ async def _handle_list_callback(
             _pop_entry(context)
             await _show_main_menu(update, context)
             return
-        if data.startswith("admin:list:page:"):
-            parts = data.split(":")
-            page_part = parts[-1]
-            entry = _current_entry(context) or {"data": {}}
-            current_page = entry.get("data", {}).get("page", 1)
-            if page_part == "noop":
-                await _show_event_list(update, context, page=current_page)
-                return
-            try:
-                requested_page = int(page_part)
-            except ValueError:
-                await _show_event_list(
-                    update,
-                    context,
-                    page=current_page,
-                    status_message="Некорректный номер страницы.",
-                )
-                return
-            bot_data = context.application.bot_data if context.application else None
-            events_refresh_if_stale(bot_data=bot_data)
-            _, total_pages, total, actual_page = get_events_page(
-                requested_page, PAGE_SIZE, bot_data=bot_data
-            )
-            if total == 0:
-                await _show_event_list(update, context, page=1)
-                return
-            if requested_page < 1 or requested_page > total_pages:
-                await _show_event_list(
-                    update,
-                    context,
-                    page=actual_page,
-                    status_message="Страница вне диапазона.",
-                )
-                return
-            await _show_event_list(update, context, page=requested_page)
-            return
         if data.startswith("admin:list:pick:"):
             event_id = data.split(":", 2)[2]
             _push_entry(context, "event", event_id=event_id)
@@ -1162,7 +1160,6 @@ async def _handle_list_callback(
         await _show_event_list(
             update,
             context,
-            page=1,
             status_message="Не удалось обработать запрос. Попробуйте позже.",
         )
 
@@ -1195,7 +1192,7 @@ async def _handle_nav_back(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         if event_id:
             await _show_event_menu(update, context, event_id)
         else:
-            await _show_event_list(update, context, page=1)
+            await _show_event_list(update, context)
         return
     _pop_entry(context)
     previous = _current_entry(context)
@@ -1209,7 +1206,7 @@ async def _handle_nav_back(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if screen == "main":
         await _show_main_menu(update, context)
     elif screen == "list":
-        await _show_event_list(update, context, page=data.get("page", 1))
+        await _show_event_list(update, context)
     elif screen == "event":
         await _show_event_menu(update, context, data.get("event_id"))
     elif screen == "new":
