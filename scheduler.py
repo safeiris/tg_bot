@@ -33,11 +33,13 @@ async def _send_timed_reminder(application, event_id: str, label: str) -> None:
             f"Напоминаем: уже завтра встречаемся на «{ctx['title']}».\n"
             f"Старт {ctx['local_datetime']} ({ctx['timezone']})."
         )
-    else:
+    elif label == "hour":
         text = (
             f"Через час начинаем «{ctx['title']}»!\n"
             f"Старт в {ctx['local_datetime']} ({ctx['timezone']})."
         )
+    else:
+        text = "Мы начали!"
 
     reply_markup: InlineKeyboardMarkup | None = None
     if zoom_link:
@@ -146,6 +148,7 @@ def schedule_all_reminders(application) -> None:
 
     day_before = event_dt - timedelta(days=1)
     hour_before = event_dt - timedelta(hours=1)
+    start_time = event_dt
     day_after = event_dt + timedelta(days=1)
 
     text_day_after = "Спасибо, что были с нами 💕 Поделитесь впечатлениями?"
@@ -165,6 +168,14 @@ def schedule_all_reminders(application) -> None:
         application,
         event_id_str,
         "hour",
+    )
+    _schedule_job(
+        f"{event_id_str}::start",
+        start_time,
+        _send_timed_reminder,
+        application,
+        event_id_str,
+        "start",
     )
     _schedule_job(
         f"{event_id_str}::feedback",

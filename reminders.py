@@ -21,10 +21,13 @@ TZ = ZoneInfo(TIMEZONE)
 
 REMINDER_DAY_LABEL = "day"
 REMINDER_HOUR_LABEL = "hour"
+REMINDER_START_LABEL = "start"
 REMINDER_LABELS: tuple[tuple[str, timedelta], ...] = (
     (REMINDER_DAY_LABEL, timedelta(days=1)),
     (REMINDER_HOUR_LABEL, timedelta(hours=1)),
+    (REMINDER_START_LABEL, timedelta(0)),
 )
+REMINDER_VALID_LABELS = {label for label, _ in REMINDER_LABELS}
 
 
 def _user_job_prefix(event_id: str) -> str:
@@ -63,11 +66,13 @@ def _build_user_reminder_payload(
             f"Напоминаем: уже завтра встречаемся на «{title}».\n"
             f"Старт {start_text}."
         )
-    else:
+    elif label == REMINDER_HOUR_LABEL:
         text = (
             f"Через час начинаем «{title}»!\n"
             f"Старт в {start_text}."
         )
+    else:
+        text = "Мы начали!"
     zoom_link = (getattr(event, "zoom_url", "") or "").strip()
     reply_markup: Optional[InlineKeyboardMarkup] = None
     if zoom_link:
@@ -131,7 +136,7 @@ async def _deliver_user_event_reminder(context: ContextTypes.DEFAULT_TYPE) -> No
     chat_id = data.get("chat_id")
     event_id = data.get("event_id")
     label = data.get("label")
-    if not chat_id or not event_id or label not in {REMINDER_DAY_LABEL, REMINDER_HOUR_LABEL}:
+    if not chat_id or not event_id or label not in REMINDER_VALID_LABELS:
         return
     event = get_event(event_id)
     if not event:
