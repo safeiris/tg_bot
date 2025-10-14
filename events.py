@@ -183,7 +183,7 @@ def _get_index_state(
     return _events_index_cache
 
 
-SHEET_NAME_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}__[\w-]+(?:-\d+)?$")
+SHEET_NAME_PATTERN = re.compile(r"^\d{2}-\d{2}-\d{4}__[\w-]+(?:-\d+)?$")
 
 
 def _collect_sheet_index() -> Dict[str, Dict[str, Any]]:
@@ -721,7 +721,7 @@ def _slugify(text: str) -> str:
 
 def _generate_event_id(title: str, event_dt: datetime) -> str:
     slug = _slugify(title)
-    date_part = event_dt.astimezone(TZ).strftime("%Y-%m-%d")
+    date_part = event_dt.astimezone(TZ).strftime("%d-%m-%Y")
     base = f"{date_part}__{slug}"
     events, _ = load_events()
     existing_ids = {event.event_id for event in events}

@@ -221,7 +221,9 @@ def get_current_worksheet() -> gspread.Worksheet:
 
 
 def _now_timestamp() -> str:
-    return datetime.now(TZ).isoformat()
+    """Return the current timestamp formatted for sheet entries."""
+
+    return datetime.now(TZ).strftime("%d.%m.%Y %H:%M")
 
 
 def _find_row_by_chat_id(
