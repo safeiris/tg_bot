@@ -21,15 +21,18 @@ from telegram.ext import (
 import database
 from config import TIMEZONE, is_admin, load_settings
 from database import ROLE_FREE, ROLE_PAID, format_role
-from message_templates import (
-    build_free_confirmation,
-    build_paid_pending_confirmation,
-    get_event_context,
+from events import (
+    find_event_id_by_key_persistently,
+    get_current_event_id,
+    get_event,
+    set_current_event,
 )
+from message_templates import build_free_confirmation, build_paid_pending_confirmation, get_event_context
 from reminders import plan_user_event_reminders
 from zoneinfo import ZoneInfo
 
 from admin_panel import show_main_menu
+from utils import map_event_key, resolve_event_id
 
 EMAIL_REGEX = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
@@ -93,6 +96,7 @@ def _update_conversation_state(update: Update, new_state: object) -> None:
 
 USER_REGISTER = "user:register"
 USER_FEEDBACK = "user:feedback"
+USER_RESTART = "user:restart"
 
 TZ = ZoneInfo(TIMEZONE)
 
@@ -134,6 +138,24 @@ def _reset_user_input_state(context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.pop("pending_registration", None)
 
 
+def _clear_user_panel_cache(context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.pop("last_user_panel_msg_id", None)
+    context.user_data.pop("last_user_panel_signature", None)
+
+
+def _clear_global_feedback_flag(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: Optional[int]
+) -> None:
+    if chat_id is None:
+        return
+    application = context.application
+    if application is None:
+        return
+    awaiting = application.bot_data.get("awaiting_feedback")
+    if isinstance(awaiting, set):
+        awaiting.discard(chat_id)
+
+
 def _get_event_datetime(settings: Optional[dict] = None) -> Optional[datetime]:
     if settings is None:
         settings = load_settings()
@@ -161,7 +183,9 @@ def _participant_status(chat_id: int) -> ParticipantStatus:
     )
 
 
-def _build_event_message(settings: dict, status: ParticipantStatus, extra: Optional[str] = None) -> str:
+def _build_event_message(
+    settings: dict, status: ParticipantStatus, extra: Optional[str] = None
+) -> str:
     ctx = get_event_context(settings)
     lines = []
     lines.append(f"🧠 {ctx['title']}")
@@ -188,6 +212,7 @@ def _build_user_keyboard(status: ParticipantStatus) -> InlineKeyboardMarkup:
     if not status.registered:
         keyboard.append([InlineKeyboardButton("✅ Зарегистрироваться", callback_data=USER_REGISTER)])
     keyboard.append([InlineKeyboardButton("📝 Оставить отзыв", callback_data=USER_FEEDBACK)])
+    keyboard.append([InlineKeyboardButton("🔄 Начать заново", callback_data=USER_RESTART)])
     return InlineKeyboardMarkup(keyboard)
 
 
@@ -196,19 +221,24 @@ async def _render_user_panel(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
     status_message: Optional[str] = None,
+    status_obj: Optional[ParticipantStatus] = None,
+    fresh_panel: bool = False,
 ) -> None:
     chat = update.effective_chat
     if chat is None:
         return
     chat_id = chat.id
     settings = load_settings()
-    status = _participant_status(chat_id)
+    status = status_obj or _participant_status(chat_id)
     text = _build_event_message(settings, status, status_message)
     keyboard = _build_user_keyboard(status)
     signature = _panel_signature(text, keyboard)
     query = update.callback_query
-    message = query.message if query else None
+    message = query.message if (query and not fresh_panel) else None
     stored_id = context.user_data.get("last_user_panel_msg_id")
+    if fresh_panel:
+        _clear_user_panel_cache(context)
+        stored_id = None
     if message and message.chat_id == chat_id:
         if stored_id and stored_id != message.message_id:
             message = None
@@ -280,47 +310,127 @@ async def _refresh_panel_from_state(
     _store_panel_state(context, message_id=sent.message_id, signature=signature)
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    user = update.effective_user
-    if user and is_admin(chat_id=user.id, username=user.username):
-        import admin_panel
+def _payload_candidates(payload: str) -> list[str]:
+    raw = payload.strip()
+    if not raw:
+        return []
+    variants = {raw}
+    for sep in (":", "-", "_"):
+        if sep in raw:
+            _, tail = raw.split(sep, 1)
+            if tail:
+                variants.add(tail)
+    return [item.strip() for item in variants if item.strip()]
 
-        renderer = getattr(admin_panel, "show_admin_panel", None)
-        if renderer is None:
-            renderer = getattr(admin_panel, "show_main_menu", None)
-        if renderer is None:
-            logger.error("Admin panel renderer is unavailable in admin_panel module")
-            chat = update.effective_chat
-            if chat:
-                await context.bot.send_message(
-                    chat_id=chat.id,
-                    text="⚠️ Внутренняя ошибка UI админа…",
-                )
-            return ConversationHandler.END
-        try:
-            await renderer(update, context)
-        except Exception:
-            logger.exception("Failed to render admin panel during /start")
-            chat = update.effective_chat
-            if chat:
-                await context.bot.send_message(
-                    chat_id=chat.id,
-                    text="⚠️ Внутренняя ошибка UI админа…",
-                )
-        return ConversationHandler.END
 
+def _activate_event_payload(
+    context: ContextTypes.DEFAULT_TYPE, payload: Optional[str]
+) -> Optional[str]:
+    if not payload:
+        return None
+    candidates = _payload_candidates(payload)
+    if not candidates:
+        return None
+    for candidate in candidates:
+        event_id = resolve_event_id(context, candidate)
+        if not event_id:
+            event_id = find_event_id_by_key_persistently(candidate)
+        if not event_id:
+            event = get_event(candidate)
+            event_id = event.event_id if event else None
+        if not event_id:
+            continue
+        event = get_event(event_id)
+        if event is None:
+            continue
+        if context.application is not None:
+            map_event_key(context, candidate, event_id)
+        current = get_current_event_id()
+        if current != event_id:
+            set_current_event(event_id)
+        return event_id
+    return None
+
+
+async def _enter_user_flow(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    fresh_panel: bool,
+    payload: Optional[str] = None,
+) -> int:
     chat = update.effective_chat
-    chat_id = chat.id if chat else None
-    status = _participant_status(chat_id) if chat_id is not None else ParticipantStatus(False, False)
-    await _render_user_panel(update=update, context=context)
-    context.user_data.pop("awaiting_feedback", None)
-    context.user_data.pop("pending_registration", None)
-    if chat_id is not None and not status.registered:
+    if chat is None:
+        return ConversationHandler.END
+    chat_id = chat.id
+    _activate_event_payload(context, payload)
+    _clear_global_feedback_flag(context, chat_id)
+    _reset_user_input_state(context)
+    status = _participant_status(chat_id)
+    await _render_user_panel(
+        update=update,
+        context=context,
+        status_obj=status,
+        fresh_panel=fresh_panel,
+    )
+    if not status.registered:
         context.user_data["awaiting_email"] = True
         await context.bot.send_message(chat_id=chat_id, text="Введи e-mail одним сообщением.")
         return WAITING_EMAIL
     context.user_data.pop("awaiting_email", None)
     return PANEL
+
+
+async def _handle_admin_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    user = update.effective_user
+    if not (user and is_admin(chat_id=user.id, username=user.username)):
+        return False
+    import admin_panel
+
+    renderer = getattr(admin_panel, "show_admin_panel", None)
+    if renderer is None:
+        renderer = getattr(admin_panel, "show_main_menu", None)
+    if renderer is None:
+        logger.error("Admin panel renderer is unavailable in admin_panel module")
+        chat = update.effective_chat
+        if chat:
+            await context.bot.send_message(
+                chat_id=chat.id,
+                text="⚠️ Внутренняя ошибка UI админа…",
+            )
+        return True
+    try:
+        await renderer(update, context)
+    except Exception:
+        logger.exception("Failed to render admin panel during entry command")
+        chat = update.effective_chat
+        if chat:
+            await context.bot.send_message(
+                chat_id=chat.id,
+                text="⚠️ Внутренняя ошибка UI админа…",
+            )
+    return True
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if await _handle_admin_entry(update, context):
+        return ConversationHandler.END
+
+    payload = context.args[0] if getattr(context, "args", None) else None
+    state = await _enter_user_flow(update, context, fresh_panel=True, payload=payload)
+    return state
+
+
+async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if await _handle_admin_entry(update, context):
+        return ConversationHandler.END
+    return await _enter_user_flow(update, context, fresh_panel=True)
+
+
+async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if await _handle_admin_entry(update, context):
+        return ConversationHandler.END
+    return await _enter_user_flow(update, context, fresh_panel=True)
 
 
 async def _handle_registration(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -372,8 +482,14 @@ async def handle_user_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         new_state = await _handle_registration(update, context)
     elif data == USER_FEEDBACK:
         new_state = await _handle_feedback(update, context)
+    elif data == USER_RESTART:
+        new_state = await _handle_user_restart(update, context)
     _update_conversation_state(update, new_state)
     return new_state
+
+
+async def _handle_user_restart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _enter_user_flow(update, context, fresh_panel=True)
 
 
 async def handle_email(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -523,7 +639,11 @@ async def feedback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 def build_conversation_handler() -> ConversationHandler:
     global _conversation_handler
     conversation = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
+        entry_points=[
+            CommandHandler("start", start),
+            CommandHandler("menu", menu),
+            CommandHandler("reset", reset),
+        ],
         states={
             PANEL: [],
             WAITING_EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_email)],
@@ -535,7 +655,12 @@ def build_conversation_handler() -> ConversationHandler:
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_feedback_text)
             ],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            CommandHandler("start", start),
+            CommandHandler("menu", menu),
+            CommandHandler("reset", reset),
+        ],
         allow_reentry=True,
     )
     _conversation_handler = conversation
