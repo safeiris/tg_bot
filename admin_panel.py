@@ -42,10 +42,80 @@ from scheduler import (
 
 TZ = ZoneInfo(TIMEZONE)
 WIZARD_STEP_TITLE = "title"
+WIZARD_STEP_DESCRIPTION = "description"
 WIZARD_STEP_DATETIME = "datetime"
 WIZARD_STEP_ZOOM = "zoom"
 WIZARD_STEP_PAY = "pay"
 WIZARD_STEP_READY = "ready"
+
+DESCRIPTION_PREVIEW_MIN = 120
+DESCRIPTION_PREVIEW_MAX = 180
+DESCRIPTION_CARD_LIMIT = 400
+MIN_DESCRIPTION_LENGTH = 10
+
+
+def _normalize_description(text: str) -> str:
+    stripped = (text or "").strip()
+    if not stripped:
+        return ""
+    lines = stripped.splitlines()
+    normalized_lines: List[str] = []
+    for line in lines:
+        collapsed = re.sub(r"\s+", " ", line.strip())
+        normalized_lines.append(collapsed)
+    normalized = "\n".join(normalized_lines)
+    normalized = re.sub(r"\n{3,}", "\n\n", normalized)
+    return normalized.strip()
+
+
+def _preview_text(
+    text: str,
+    *,
+    max_length: int = DESCRIPTION_PREVIEW_MAX,
+    min_length: int = DESCRIPTION_PREVIEW_MIN,
+) -> str:
+    cleaned = re.sub(r"\s+", " ", (text or "")).strip()
+    if not cleaned:
+        return ""
+    if len(cleaned) <= max_length:
+        return cleaned
+    cutoff = cleaned.rfind(" ", min_length, max_length)
+    if cutoff == -1:
+        cutoff = max_length
+    preview = cleaned[:cutoff].rstrip()
+    return f"{preview}…"
+
+
+def _description_for_card(text: str, *, limit: int = DESCRIPTION_CARD_LIMIT) -> str:
+    normalized = _normalize_description(text)
+    if not normalized:
+        return ""
+    if len(normalized) <= limit:
+        return normalized
+    upper_bound = max(min(limit, DESCRIPTION_PREVIEW_MAX), DESCRIPTION_PREVIEW_MIN)
+    lower_bound = min(DESCRIPTION_PREVIEW_MIN, upper_bound)
+    return _preview_text(normalized, max_length=upper_bound, min_length=lower_bound)
+
+
+WIZARD_FLOW_ORDER = [
+    WIZARD_STEP_TITLE,
+    WIZARD_STEP_DESCRIPTION,
+    WIZARD_STEP_DATETIME,
+    WIZARD_STEP_ZOOM,
+    WIZARD_STEP_PAY,
+    WIZARD_STEP_READY,
+]
+
+
+def _wizard_previous_step(step: str) -> Optional[str]:
+    try:
+        index = WIZARD_FLOW_ORDER.index(step)
+    except ValueError:
+        return None
+    if index <= 0:
+        return None
+    return WIZARD_FLOW_ORDER[index - 1]
+
 
 ACTIVE_EVENT_WARNING = (
     "⚠️ Пока есть активное мероприятие.\n"
@@ -295,8 +365,11 @@ def _format_event_card(event: Optional[Event], status_message: Optional[str] = N
         }.get(status, status)
         lines.append(f"Статус: {status_label}")
         lines.append(f"🧠 Название: {html.escape(event.title or '—')}")
-        description = event.description or "—"
-        lines.append(f"📝 Описание: {html.escape(description)}")
+        description_value = event.description or ""
+        description_label = html.escape(
+            _description_for_card(description_value) or "—"
+        )
+        lines.append(f"📝 Описание: {description_label}")
         lines.append(f"📅 Дата и время: {html.escape(_format_event_datetime(event))}")
         zoom = html.escape(event.zoom_url or "—")
         lines.append(f"🔗 Zoom: {zoom}")
@@ -473,6 +546,7 @@ def _draft(context: ContextTypes.DEFAULT_TYPE) -> Dict[str, object]:
         "draft_event",
         {
             "title": "",
+            "description": "",
             "datetime": None,
             "timezone": TIMEZONE,
             "zoom_url": "",
@@ -515,6 +589,7 @@ def _wizard_state(context: ContextTypes.DEFAULT_TYPE) -> Dict[str, object]:
     step = state.get("step")
     if step not in {
         WIZARD_STEP_TITLE,
+        WIZARD_STEP_DESCRIPTION,
         WIZARD_STEP_DATETIME,
         WIZARD_STEP_ZOOM,
         WIZARD_STEP_PAY,
@@ -538,6 +613,7 @@ def _wizard_prompt(step: str) -> Optional[str]:
     # UX update: confirmation screen + cleaned messages
     prompts = {
         WIZARD_STEP_TITLE: "Введи название встречи.",
+        WIZARD_STEP_DESCRIPTION: "Введи описание встречи одним сообщением.",
         WIZARD_STEP_DATETIME: "Введи дату и время в формате ДД.ММ.ГГГГ ЧЧ:ММ.",
         WIZARD_STEP_ZOOM: "Вставь ссылку на Zoom.",
         WIZARD_STEP_PAY: "Вставь ссылку на оплату.",
@@ -546,7 +622,7 @@ def _wizard_prompt(step: str) -> Optional[str]:
 
 
 def _wizard_ready(draft: Dict[str, object]) -> bool:
-    return bool(draft.get("title") and draft.get("datetime"))
+    return bool(draft.get("title") and draft.get("description") and draft.get("datetime"))
 
 
 def _draft_text(
@@ -556,6 +632,13 @@ def _draft_text(
 ) -> str:
     lines = ["🛠 Создание мероприятия"]
     lines.append(f"📛 Название: {html.escape((draft.get('title') or '').strip() or '—')}")
+    description_value = draft.get("description") or ""
+    description_display = (
+        html.escape(_description_for_card(description_value))
+        if description_value
+        else "—"
+    )
+    lines.append(f"📝 Описание: {description_display}")
     lines.append(f"📅 Дата/время: {html.escape(_format_draft_datetime(draft))}")
     zoom = (draft.get("zoom_url") or "").strip() or "—"
     lines.append(f"🔗 Zoom: {html.escape(zoom)}")
@@ -573,6 +656,13 @@ def _draft_text(
 
 def _new_event_keyboard(ready: bool, step: str) -> InlineKeyboardMarkup:
     rows: List[List[InlineKeyboardButton]] = []
+    if step in {
+        WIZARD_STEP_DESCRIPTION,
+        WIZARD_STEP_DATETIME,
+        WIZARD_STEP_ZOOM,
+        WIZARD_STEP_PAY,
+    }:
+        rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="admin:new:back")])
     if step == WIZARD_STEP_ZOOM:
         rows.append([
             InlineKeyboardButton("⏭ Пропустить", callback_data="admin:new:skip_zoom")
@@ -796,6 +886,17 @@ async def _handle_new_event_callback(
     if not await _ensure_no_active_event(update, context):
         return
     chat = update.effective_chat
+    if data == "admin:new:back":
+        current_step = _wizard_current_step(context)
+        previous_step = _wizard_previous_step(current_step)
+        if not previous_step:
+            await _handle_nav_back(update, context)
+            return
+        _set_wizard_step(context, previous_step)
+        context.user_data["await"] = {"type": "wizard", "step": previous_step}
+        await _show_new_event(update, context)
+        await _prompt_wizard_step(update, context)
+        return
     if data == "admin:new:skip_zoom":
         draft = _draft(context)
         draft["zoom_url"] = ""
@@ -825,8 +926,9 @@ async def _handle_new_event_callback(
     if data == "admin:new:create":
         draft = _draft(context)
         title = (draft.get("title") or "").strip()
+        description = (draft.get("description") or "").strip()
         dt: Optional[datetime] = draft.get("datetime")
-        if not title or not dt:
+        if not title or not description or not dt:
             await _show_new_event(
                 update, context, status_message="Недостаточно данных для создания."
             )
@@ -836,7 +938,7 @@ async def _handle_new_event_callback(
         pay_url = (draft.get("pay_url") or "").strip()
         event = create_event(
             title=title,
-            description="",
+            description=description,
             event_dt=dt,
             timezone=timezone,
             zoom_url=zoom_url,
@@ -853,10 +955,14 @@ async def _handle_new_event_callback(
         zoom_text = html.escape(event.zoom_url or "—")
         pay_text = html.escape(event.pay_url or "—")
         sheet_text = html.escape(event.sheet_link or "—")
+        description_preview = html.escape(
+            _description_for_card(event.description) or "—"
+        )
         summary_lines = [
             "🎉 Встреча успешно создана!",
             "",
             f"📛 Название: {html.escape(event.title or '—')}",
+            f"📝 Описание: {description_preview}",
             f"📅 Дата/время: {formatted_dt} ({tz_label})",
             f"🔗 Zoom: {zoom_text}",
             f"💳 Оплата: {pay_text}",
@@ -1017,8 +1123,27 @@ async def _handle_wizard_message(
         if not text:
             await update.message.reply_text("Название не может быть пустым. Попробуй снова.")
             return
-        draft["title"] = text
-        await update.message.reply_text(f"✅ Название задано: {text}")
+        normalized_title = " ".join(text.split())
+        draft["title"] = normalized_title
+        await update.message.reply_text(f"✅ Название задано: {normalized_title}")
+        _set_wizard_step(context, WIZARD_STEP_DESCRIPTION)
+        context.user_data["await"] = {"type": "wizard", "step": WIZARD_STEP_DESCRIPTION}
+        await _show_new_event(update, context)
+        await _prompt_wizard_step(update, context)
+        return
+    if step == WIZARD_STEP_DESCRIPTION:
+        normalized_description = _normalize_description(text)
+        if len(normalized_description) < MIN_DESCRIPTION_LENGTH:
+            await update.message.reply_text(
+                "Похоже, описание пустое. Введи текст или нажми “Назад”."
+            )
+            return
+        draft["description"] = normalized_description
+        preview = _preview_text(normalized_description)
+        confirmation = "✅ Описание установлено."
+        if preview:
+            confirmation = f"{confirmation}\n\n{preview}"
+        await update.message.reply_text(confirmation)
         _set_wizard_step(context, WIZARD_STEP_DATETIME)
         context.user_data["await"] = {"type": "wizard", "step": WIZARD_STEP_DATETIME}
         await _show_new_event(update, context)
@@ -1379,9 +1504,17 @@ async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYP
         await _show_event_menu(update, context, event_id)
         return
     if state_type == "ev_edit_desc":
-        update_event(event_id, {"description": text})
+        normalized_description = _normalize_description(text)
+        if len(normalized_description) < MIN_DESCRIPTION_LENGTH:
+            await update.message.reply_text("Описание не может быть пустым. Попробуй снова.")
+            return
+        update_event(event_id, {"description": normalized_description})
         if update.message:
-            await update.message.reply_text("✅ Описание обновлено.")
+            preview = _preview_text(normalized_description)
+            confirmation = "✅ Описание обновлено."
+            if preview:
+                confirmation = f"{confirmation}\n\n{preview}"
+            await update.message.reply_text(confirmation)
         _clear_await(context)
         await _show_event_menu(update, context, event_id)
         return

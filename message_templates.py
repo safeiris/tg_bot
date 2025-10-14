@@ -4,6 +4,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Dict, Optional
 
+import re
 from zoneinfo import ZoneInfo
 
 from config import TIMEZONE, load_settings
@@ -26,6 +27,8 @@ MONTH_NAMES = [
 ]
 TZ = ZoneInfo(TIMEZONE)
 
+DESCRIPTION_LIMIT = 400
+
 
 def _format_value(value: Optional[object]) -> str:
     if value is None:
@@ -34,6 +37,25 @@ def _format_value(value: Optional[object]) -> str:
         stripped = value.strip()
         return stripped if stripped else MISSING_VALUE
     return str(value)
+
+
+def _short_description(value: Optional[object], limit: int = DESCRIPTION_LIMIT) -> str:
+    if value is None:
+        return MISSING_VALUE
+    if isinstance(value, str):
+        text = value.strip()
+    else:
+        text = str(value).strip()
+    if not text:
+        return MISSING_VALUE
+    normalized = re.sub(r"\s+", " ", text)
+    if len(normalized) <= limit:
+        return normalized
+    window_start = max(0, limit - 80)
+    cutoff = normalized.rfind(" ", window_start, limit)
+    if cutoff == -1 or cutoff < window_start:
+        cutoff = limit
+    return f"{normalized[:cutoff].rstrip()}…"
 
 
 def _format_datetime(event_iso: Optional[object]) -> str:
@@ -58,7 +80,7 @@ def get_event_context(settings: Optional[Dict[str, object]] = None) -> Dict[str,
         settings = load_settings()
 
     topic = _format_value(settings.get("topic"))
-    description = _format_value(settings.get("description"))
+    description = _short_description(settings.get("description"))
     payment_link = _format_value(settings.get("payment_link"))
 
     local_dt = _format_datetime(settings.get("current_event_datetime"))
