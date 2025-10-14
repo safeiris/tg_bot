@@ -19,6 +19,7 @@ from telegram.ext import (
 )
 
 import database
+import notifications
 from config import TIMEZONE, is_admin, load_settings
 from database import ROLE_FREE, ROLE_PAID, format_role
 from events import (
@@ -27,8 +28,12 @@ from events import (
     get_event,
     set_current_event,
 )
-from message_templates import build_free_confirmation, build_paid_pending_confirmation, get_event_context
-from reminders import plan_user_event_reminders
+from message_templates import (
+    build_free_confirmation,
+    build_paid_pending_confirmation,
+    get_event_context,
+)
+from reminders import cancel_user_event_reminders_for_chat, plan_user_event_reminders
 from zoneinfo import ZoneInfo
 
 from admin_panel import show_main_menu
@@ -97,6 +102,7 @@ def _update_conversation_state(update: Update, new_state: object) -> None:
 USER_REGISTER = "user:register"
 USER_FEEDBACK = "user:feedback"
 USER_RESTART = "user:restart"
+USER_PAID_CONFIRMED = "user:paid_confirm"
 
 TZ = ZoneInfo(TIMEZONE)
 
@@ -183,6 +189,20 @@ def _participant_status(chat_id: int) -> ParticipantStatus:
     )
 
 
+def _resolve_payment_link(settings: dict) -> str:
+    payment_link = str(settings.get("payment_link") or "").strip()
+    event_id = settings.get("current_event_id")
+    if event_id:
+        event = get_event(str(event_id))
+        if event:
+            event_link = (event.pay_url or "").strip()
+            if event_link:
+                payment_link = event_link
+    if payment_link.startswith("❗️"):
+        return ""
+    return payment_link
+
+
 def _build_event_message(
     settings: dict, status: ParticipantStatus, extra: Optional[str] = None
 ) -> str:
@@ -196,6 +216,9 @@ def _build_event_message(
         lines.append(f"📧 E-mail: {status.email or '—'}")
         if status.role:
             lines.append(f"👤 Тип участия: {status.role}")
+        if status.role == ROLE_PAID:
+            payment_label = "Оплачено" if status.paid else "Ожидает оплату"
+            lines.append(f"💳 Статус оплаты: {payment_label}")
     else:
         lines.append("📧 E-mail: —")
         lines.append("👤 Тип участия: —")
@@ -358,6 +381,7 @@ async def _enter_user_flow(
     *,
     fresh_panel: bool,
     payload: Optional[str] = None,
+    force_registration: bool = False,
 ) -> int:
     chat = update.effective_chat
     if chat is None:
@@ -367,13 +391,31 @@ async def _enter_user_flow(
     _clear_global_feedback_flag(context, chat_id)
     _reset_user_input_state(context)
     status = _participant_status(chat_id)
+    panel_status = status
+    status_message: Optional[str] = None
+    if force_registration:
+        settings_snapshot = load_settings()
+        event_id = settings_snapshot.get("current_event_id")
+        if status.registered and event_id:
+            cancel_user_event_reminders_for_chat(
+                context, chat_id=chat_id, event_id=str(event_id)
+            )
+        if status.registered:
+            try:
+                database.unregister_participant(chat_id)
+            except RuntimeError:
+                logger.debug("Failed to unregister participant during reset", exc_info=True)
+            status = _participant_status(chat_id)
+        panel_status = ParticipantStatus(registered=False, paid=False)
+        status_message = "Начнём регистрацию заново."
     await _render_user_panel(
         update=update,
         context=context,
-        status_obj=status,
+        status_obj=panel_status,
+        status_message=status_message,
         fresh_panel=fresh_panel,
     )
-    if not status.registered:
+    if not panel_status.registered:
         context.user_data["awaiting_email"] = True
         await context.bot.send_message(chat_id=chat_id, text="Введи e-mail одним сообщением.")
         return WAITING_EMAIL
@@ -417,7 +459,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return ConversationHandler.END
 
     payload = context.args[0] if getattr(context, "args", None) else None
-    state = await _enter_user_flow(update, context, fresh_panel=True, payload=payload)
+    force_registration = bool(payload)
+    state = await _enter_user_flow(
+        update,
+        context,
+        fresh_panel=True,
+        payload=payload,
+        force_registration=force_registration,
+    )
     return state
 
 
@@ -430,7 +479,7 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if await _handle_admin_entry(update, context):
         return ConversationHandler.END
-    return await _enter_user_flow(update, context, fresh_panel=True)
+    return await _enter_user_flow(update, context, fresh_panel=True, force_registration=True)
 
 
 async def _handle_registration(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -484,12 +533,81 @@ async def handle_user_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         new_state = await _handle_feedback(update, context)
     elif data == USER_RESTART:
         new_state = await _handle_user_restart(update, context)
+    elif data == USER_PAID_CONFIRMED:
+        new_state = await _handle_payment_confirmation(update, context)
     _update_conversation_state(update, new_state)
     return new_state
 
 
 async def _handle_user_restart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    return await _enter_user_flow(update, context, fresh_panel=True)
+    return await _enter_user_flow(
+        update,
+        context,
+        fresh_panel=True,
+        force_registration=True,
+    )
+
+
+async def _handle_payment_confirmation(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    query = update.callback_query
+    chat = update.effective_chat
+    if chat is None:
+        return PANEL
+    chat_id = chat.id
+    status = _participant_status(chat_id)
+    if not status.registered or status.role != ROLE_PAID:
+        if query:
+            try:
+                await query.answer("Сначала зарегистрируйтесь на мероприятие.", show_alert=True)
+            except Exception:
+                logger.debug("Failed to answer payment callback without registration", exc_info=True)
+        return PANEL
+    if status.paid:
+        if query:
+            try:
+                await query.answer("Оплата уже подтверждена.")
+            except Exception:
+                logger.debug("Failed to answer already paid callback", exc_info=True)
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except TelegramError:
+                pass
+        return PANEL
+    settings = load_settings()
+    try:
+        await notifications.send_paid_confirmation(
+            context.bot,
+            chat_id,
+            settings=settings,
+        )
+    except Exception:
+        logger.exception("Failed to send paid confirmation to %s", chat_id)
+        if query:
+            try:
+                await query.answer("Не удалось подтвердить оплату. Попробуйте позже.", show_alert=True)
+            except Exception:
+                logger.debug("Failed to answer payment failure callback", exc_info=True)
+        return PANEL
+    if query:
+        try:
+            await query.edit_message_text("✅ Оплата отмечена. Спасибо! Ждём вас на встрече.")
+        except TelegramError:
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except TelegramError:
+                pass
+        try:
+            await query.answer("Оплату зафиксировали 🙌")
+        except Exception:
+            logger.debug("Failed to answer payment confirmation callback", exc_info=True)
+    await _refresh_panel_from_state(
+        context=context,
+        chat_id=chat_id,
+        status_message="Оплату зафиксировали. До встречи!",
+    )
+    return PANEL
 
 
 async def handle_email(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -510,6 +628,7 @@ async def handle_email(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         }
     )
     context.user_data["awaiting_email"] = False
+    await update.message.reply_text("E-mail записали ✅")
     await update.message.reply_text(
         "Выбери тип участия:", reply_markup=_role_selection_keyboard()
     )
@@ -558,9 +677,18 @@ async def handle_role_selection(update: Update, context: ContextTypes.DEFAULT_TY
 
     await query.edit_message_text(f"✅ Тип участия: {role_label}")
     settings = load_settings()
+    payment_markup: Optional[InlineKeyboardMarkup] = None
     if role_label == ROLE_PAID:
         confirmation = build_paid_pending_confirmation(settings)
+        payment_link = _resolve_payment_link(settings)
         status_message = "Мы записали ваши данные. Ссылку на оплату отправили сообщением."
+        buttons: list[list[InlineKeyboardButton]] = []
+        if payment_link:
+            buttons.append([
+                InlineKeyboardButton("💳 Перейти к оплате", url=payment_link)
+            ])
+        buttons.append([InlineKeyboardButton("✅ Я оплатил", callback_data=USER_PAID_CONFIRMED)])
+        payment_markup = InlineKeyboardMarkup(buttons)
     else:
         confirmation = build_free_confirmation(settings)
         status_message = "Вы успешно зарегистрированы!"
@@ -575,6 +703,7 @@ async def handle_role_selection(update: Update, context: ContextTypes.DEFAULT_TY
     await context.bot.send_message(
         chat_id=chat_id,
         text=confirmation,
+        reply_markup=payment_markup,
         disable_web_page_preview=True,
     )
     await _refresh_panel_from_state(

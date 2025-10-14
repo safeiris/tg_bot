@@ -272,3 +272,12 @@ def cancel_personal_reminder(context: ContextTypes.DEFAULT_TYPE, chat_id: int, l
         name = job.name or ""
         if name.endswith(suffix):
             job.schedule_removal()
+
+
+def cancel_user_event_reminders_for_chat(
+    context: ContextTypes.DEFAULT_TYPE, *, chat_id: int, event_id: str
+) -> None:
+    application = context.application
+    if application is None or application.job_queue is None:
+        return
+    _cancel_event_jobs(application.job_queue, event_id, chat_id)
