@@ -7,7 +7,12 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    Update,
+)
 from telegram.error import TelegramError
 from telegram.ext import (
     CallbackQueryHandler,
@@ -102,6 +107,8 @@ def _update_conversation_state(update: Update, new_state: object) -> None:
 USER_REGISTER = "user:register"
 USER_FEEDBACK = "user:feedback"
 USER_RESTART = "user:restart"
+RESTART_BUTTON_TEXT = "🔄 Начать заново"
+RESTART_BUTTON_PATTERN = rf"^{re.escape(RESTART_BUTTON_TEXT)}$"
 USER_PAID_CONFIRMED = "user:paid_confirm"
 
 TZ = ZoneInfo(TIMEZONE)
@@ -113,6 +120,32 @@ class ParticipantStatus:
     paid: bool
     role: str = ""
     email: str = ""
+
+
+def _build_restart_reply_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup([[RESTART_BUTTON_TEXT]], resize_keyboard=True)
+
+
+async def _ensure_restart_reply_keyboard(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, *, force: bool = False
+) -> None:
+    keyboard_chats: set[int] | None = None
+    application = context.application
+    if application is not None:
+        keyboard_chats = application.bot_data.setdefault("restart_keyboard_chats", set())
+        if not force and chat_id in keyboard_chats:
+            return
+    try:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="Если захочется начать диалог заново, нажмите кнопку под полем ввода.",
+            reply_markup=_build_restart_reply_keyboard(),
+        )
+    except Exception:
+        logger.debug("Failed to send restart reply keyboard", exc_info=True)
+    else:
+        if keyboard_chats is not None:
+            keyboard_chats.add(chat_id)
 
 
 def _keyboard_signature(markup: InlineKeyboardMarkup) -> tuple[tuple[tuple[str, str | None, str | None], ...], ...]:
@@ -235,7 +268,7 @@ def _build_user_keyboard(status: ParticipantStatus) -> InlineKeyboardMarkup:
     if not status.registered:
         keyboard.append([InlineKeyboardButton("✅ Зарегистрироваться", callback_data=USER_REGISTER)])
     keyboard.append([InlineKeyboardButton("📝 Оставить отзыв", callback_data=USER_FEEDBACK)])
-    keyboard.append([InlineKeyboardButton("🔄 Начать заново", callback_data=USER_RESTART)])
+    keyboard.append([InlineKeyboardButton(RESTART_BUTTON_TEXT, callback_data=USER_RESTART)])
     return InlineKeyboardMarkup(keyboard)
 
 
@@ -387,6 +420,9 @@ async def _enter_user_flow(
     if chat is None:
         return ConversationHandler.END
     chat_id = chat.id
+    if force_registration:
+        context.user_data.clear()
+    await _ensure_restart_reply_keyboard(context, chat_id, force=force_registration)
     _activate_event_payload(context, payload)
     _clear_global_feedback_flag(context, chat_id)
     _reset_user_input_state(context)
@@ -417,7 +453,11 @@ async def _enter_user_flow(
     )
     if not panel_status.registered:
         context.user_data["awaiting_email"] = True
-        await context.bot.send_message(chat_id=chat_id, text="Введи e-mail одним сообщением.")
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="Введи e-mail одним сообщением.",
+            reply_markup=_build_restart_reply_keyboard(),
+        )
         return WAITING_EMAIL
     context.user_data.pop("awaiting_email", None)
     return PANEL
@@ -486,11 +526,19 @@ async def _handle_registration(update: Update, context: ContextTypes.DEFAULT_TYP
     chat_id = update.effective_chat.id
     status = _participant_status(chat_id)
     if status.registered:
-        await context.bot.send_message(chat_id=chat_id, text="Вы уже зарегистрированы.")
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="Вы уже зарегистрированы.",
+            reply_markup=_build_restart_reply_keyboard(),
+        )
         return PANEL
     context.user_data["awaiting_email"] = True
     context.user_data.pop("pending_registration", None)
-    await context.bot.send_message(chat_id=chat_id, text="Введи e-mail одним сообщением.")
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="Введи e-mail одним сообщением.",
+        reply_markup=_build_restart_reply_keyboard(),
+    )
     return WAITING_EMAIL
 
 
@@ -546,6 +594,10 @@ async def _handle_user_restart(update: Update, context: ContextTypes.DEFAULT_TYP
         fresh_panel=True,
         force_registration=True,
     )
+
+
+async def restart_via_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    return await _handle_user_restart(update, context)
 
 
 async def _handle_payment_confirmation(
@@ -613,7 +665,10 @@ async def _handle_payment_confirmation(
 async def handle_email(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     email = (update.message.text or "").strip()
     if not EMAIL_REGEX.match(email):
-        await update.message.reply_text("Кажется, это не похоже на e-mail. Попробуйте ещё раз.")
+        await update.message.reply_text(
+            "Кажется, это не похоже на e-mail. Попробуйте ещё раз.",
+            reply_markup=_build_restart_reply_keyboard(),
+        )
         return WAITING_EMAIL
 
     chat_id = update.effective_chat.id
@@ -628,7 +683,10 @@ async def handle_email(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         }
     )
     context.user_data["awaiting_email"] = False
-    await update.message.reply_text("E-mail записали ✅")
+    await update.message.reply_text(
+        "E-mail записали ✅",
+        reply_markup=_build_restart_reply_keyboard(),
+    )
     await update.message.reply_text(
         "Выбери тип участия:", reply_markup=_role_selection_keyboard()
     )
@@ -700,10 +758,13 @@ async def handle_role_selection(update: Update, context: ContextTypes.DEFAULT_TY
         except Exception:
             logger.exception("Failed to schedule personal reminders for %s", chat_id)
 
+    reply_markup = (
+        payment_markup if payment_markup is not None else _build_restart_reply_keyboard()
+    )
     await context.bot.send_message(
         chat_id=chat_id,
         text=confirmation,
-        reply_markup=payment_markup,
+        reply_markup=reply_markup,
         disable_web_page_preview=True,
     )
     await _refresh_panel_from_state(
@@ -728,12 +789,18 @@ async def handle_feedback_text(update: Update, context: ContextTypes.DEFAULT_TYP
     chat_id = update.effective_chat.id
     feedback = (update.message.text or "").strip()
     if not feedback:
-        await update.message.reply_text("Напишите, пожалуйста, текст отзыва.")
+        await update.message.reply_text(
+            "Напишите, пожалуйста, текст отзыва.",
+            reply_markup=_build_restart_reply_keyboard(),
+        )
         return WAITING_FEEDBACK
     database.update_feedback(chat_id, feedback)
     awaiting = context.application.bot_data.setdefault("awaiting_feedback", set())
     awaiting.discard(chat_id)
-    await update.message.reply_text("Спасибо за обратную связь! 💖")
+    await update.message.reply_text(
+        "Спасибо за обратную связь! 💖",
+        reply_markup=_build_restart_reply_keyboard(),
+    )
     await _refresh_panel_from_state(
         context=context,
         chat_id=chat_id,
@@ -744,7 +811,10 @@ async def handle_feedback_text(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text("Действие отменено.")
+    await update.message.reply_text(
+        "Действие отменено.",
+        reply_markup=_build_restart_reply_keyboard(),
+    )
     context.user_data.pop("awaiting_email", None)
     context.user_data.pop("awaiting_feedback", None)
     context.user_data.pop("pending_registration", None)
@@ -758,29 +828,42 @@ async def feedback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if chat_id not in awaiting:
         return
     feedback = (update.message.text or "").strip()
+    if feedback == RESTART_BUTTON_TEXT:
+        await restart_via_button(update, context)
+        return
     if not feedback:
         return
     database.update_feedback(chat_id, feedback)
     awaiting.discard(chat_id)
-    await update.message.reply_text("Спасибо за обратную связь! 💖")
+    await update.message.reply_text(
+        "Спасибо за обратную связь! 💖",
+        reply_markup=_build_restart_reply_keyboard(),
+    )
 
 
 def build_conversation_handler() -> ConversationHandler:
     global _conversation_handler
+    restart_button_filter = filters.Regex(RESTART_BUTTON_PATTERN)
     conversation = ConversationHandler(
         entry_points=[
             CommandHandler("start", start),
             CommandHandler("menu", menu),
             CommandHandler("reset", reset),
+            MessageHandler(restart_button_filter, restart_via_button),
         ],
         states={
-            PANEL: [],
-            WAITING_EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_email)],
+            PANEL: [MessageHandler(restart_button_filter, restart_via_button)],
+            WAITING_EMAIL: [
+                MessageHandler(restart_button_filter, restart_via_button),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_email),
+            ],
             WAITING_ROLE: [
                 CallbackQueryHandler(handle_role_selection, pattern=rf"^{ROLE_CALLBACK_PREFIX}"),
+                MessageHandler(restart_button_filter, restart_via_button),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_role_text),
             ],
             WAITING_FEEDBACK: [
+                MessageHandler(restart_button_filter, restart_via_button),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, handle_feedback_text)
             ],
         },
