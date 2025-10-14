@@ -104,7 +104,7 @@ def build_free_confirmation(settings: Optional[Dict[str, object]] = None) -> str
         f"🧠 {ctx['title']}\n"
         f"📅 {ctx['local_datetime']} ({ctx['timezone']})\n"
         f"📝 {ctx['description']}\n\n"
-        "👤 Тип участия: Наблюдатель (бесплатно)\n"
+        "👤 Тип участия: Участник (бесплатно)\n\n"
         "Мы пришлём напоминание за 1 день и за 1 час до начала мероприятия."
     )
 
@@ -112,7 +112,7 @@ def build_free_confirmation(settings: Optional[Dict[str, object]] = None) -> str
 def build_paid_pending_confirmation(settings: Optional[Dict[str, object]] = None) -> str:
     ctx = get_event_context(settings)
     return (
-        "🧾 Участие с разбором\n\n"
+        "🧾 Разбор (платно)\n\n"
         f"🧠 {ctx['title']}\n"
         f"📅 {ctx['local_datetime']} ({ctx['timezone']})\n\n"
         "Для подтверждения участия внесите оплату по ссылке:\n"
@@ -128,7 +128,7 @@ def build_paid_confirmation(settings: Optional[Dict[str, object]] = None) -> str
         "✅ Оплата получена\n\n"
         f"🧠 {ctx['title']}\n"
         f"📅 {ctx['local_datetime']} ({ctx['timezone']})\n"
-        "👤 Тип участия: Участник с разбором (платно)\n"
+        "👤 Тип участия: Разбор (платно)\n"
         "💳 Статус оплаты: Оплачено\n\n"
         "Мы пришлём напоминание за 1 день и за 1 час до начала мероприятия."
     )
