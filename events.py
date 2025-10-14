@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 
 import database
 from config import DATA_DIR, TIMEZONE, update_settings
+from utils import make_event_key
 
 
 TZ = ZoneInfo(TIMEZONE)
@@ -40,6 +41,7 @@ class Event:
     status: str
     created_at: str
     updated_at: str
+    key: str = ""
 
     def to_dict(self) -> Dict[str, object]:
         return asdict(self)
@@ -85,8 +87,12 @@ def _save_payload(data: Dict[str, object]) -> None:
 
 
 def _hydrate_event(item: Dict[str, object]) -> Event:
+    event_id = str(item.get("event_id"))
+    key = str(item.get("key") or "")
+    if not key:
+        key = make_event_key(event_id)
     return Event(
-        event_id=str(item.get("event_id")),
+        event_id=event_id,
         title=str(item.get("title", "")),
         description=str(item.get("description", "")),
         datetime_local=str(item.get("datetime_local", "")),
@@ -98,6 +104,7 @@ def _hydrate_event(item: Dict[str, object]) -> Event:
         status=str(item.get("status", "active")),
         created_at=str(item.get("created_at", datetime.now(TZ).isoformat())),
         updated_at=str(item.get("updated_at", datetime.now(TZ).isoformat())),
+        key=key,
     )
 
 
@@ -233,6 +240,7 @@ def _placeholder_event_dict(event_id: str) -> Dict[str, Any]:
         "status": "active",
         "created_at": now_iso,
         "updated_at": now_iso,
+        "key": make_event_key(event_id),
     }
 
 
@@ -300,6 +308,16 @@ def load_events() -> Tuple[List[Event], Optional[str]]:
     current_id = payload.get("current_event_id")
     current_id = str(current_id) if current_id else None
     return events, current_id
+
+
+def find_event_id_by_key_persistently(key: str) -> Optional[str]:
+    """Resolve an event ID by its short key using stored events."""
+    events, _ = load_events()
+    for event in events:
+        event_key = event.key or make_event_key(event.event_id)
+        if event_key == key:
+            return event.event_id
+    return None
 
 
 def _store_events(events: List[Event], current_event_id: Optional[str]) -> None:
@@ -734,6 +752,7 @@ def create_event(
             existing.status = "past"
             existing.updated_at = now_iso
     event_id = _generate_event_id(title, event_dt)
+    event_key = make_event_key(event_id)
     sheet_name, sheet_link = create_event_sheet(event_id)
     try:
         tz = ZoneInfo(timezone)
@@ -753,6 +772,7 @@ def create_event(
         status="active",
         created_at=now_iso,
         updated_at=now_iso,
+        key=event_key,
     )
     events.append(event)
     _store_events(events, current_id)

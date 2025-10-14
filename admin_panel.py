@@ -21,6 +21,7 @@ from events import (
     classify_status,
     create_event,
     events_bootstrap,
+    find_event_id_by_key_persistently,
     get_active_event,
     get_current_event,
     get_current_event_id,
@@ -32,6 +33,7 @@ from events import (
     sync_events_with_sheets,
     update_event,
 )
+from utils import make_event_key, map_event_key, resolve_event_id
 from scheduler import (
     cancel_scheduled_reminders,
     ensure_scheduler_started,
@@ -381,11 +383,14 @@ def _list_row(event: Event) -> str:
 
 
 def _event_list_keyboard(
-    active_future: List[Event], cancelled: List[Event]
+    context: ContextTypes.DEFAULT_TYPE,
+    active_future: List[Event],
+    cancelled: List[Event],
 ) -> InlineKeyboardMarkup:
     rows: List[List[InlineKeyboardButton]] = []
     selectable_events = list(active_future) + list(cancelled)
     for event in selectable_events:
+        _ensure_event_key(context, event)
         rows.append(
             [
                 InlineKeyboardButton(
@@ -412,6 +417,12 @@ def _event_has_sheet(event: Event) -> bool:
             logger.warning("Failed to verify sheet %s: %s", name, exc)
             return False
     return False
+
+
+def _ensure_event_key(context: ContextTypes.DEFAULT_TYPE, event: Event) -> str:
+    key = getattr(event, "key", "") or make_event_key(event.event_id)
+    map_event_key(context, key, event.event_id)
+    return key
 
 
 async def _show_event_list(
@@ -441,7 +452,7 @@ async def _show_event_list(
         lines.append("")
         lines.append(status_message)
     text = "\n".join(lines)
-    keyboard = _event_list_keyboard(active_future, cancelled)
+    keyboard = _event_list_keyboard(context, active_future, cancelled)
     _replace_top(context, "list")
     await _send_panel(update, context, text, keyboard)
 
@@ -668,8 +679,11 @@ def _format_event_detail(event: Event, status_message: Optional[str] = None) -> 
     return "\n".join(lines)
 
 
-def _event_menu_keyboard(event: Event) -> InlineKeyboardMarkup:
-    base = f"admin:ev:{event.event_id}"
+def _event_menu_keyboard(
+    context: ContextTypes.DEFAULT_TYPE, event: Event
+) -> InlineKeyboardMarkup:
+    key = _ensure_event_key(context, event)
+    base = f"admin:e:{key}"
     status = classify_status(event)
     rows: List[List[InlineKeyboardButton]]
     if status == "active":
@@ -716,7 +730,7 @@ async def _show_event_menu(
         return
     _replace_top(context, "event", event_id=event_id)
     text = _format_event_detail(event, status_message)
-    await _send_panel(update, context, text, _event_menu_keyboard(event))
+    await _send_panel(update, context, text, _event_menu_keyboard(context, event))
 
 
 async def _show_cancel_confirmation(
@@ -729,15 +743,17 @@ async def _show_cancel_confirmation(
         await _show_event_list(update, context, status_message="Событие не найдено.")
         return
     question = f"Отменить мероприятие «{html.escape(event.title or '—')}»?"
+    key = _ensure_event_key(context, event)
+    base = f"admin:e:{key}"
     keyboard = InlineKeyboardMarkup(
         _add_home_button(
             [
                 [
                     InlineKeyboardButton(
-                        "Да, отменить", callback_data=f"admin:ev:{event_id}:cancel:yes"
+                        "Да, отменить", callback_data=f"{base}:cancel:yes"
                     )
                 ],
-                [InlineKeyboardButton("Нет", callback_data=f"admin:ev:{event_id}:back")],
+                [InlineKeyboardButton("Нет", callback_data=f"{base}:back")],
             ]
         )
     )
@@ -1133,9 +1149,12 @@ async def _handle_menu_callback(
             return
     except Exception:
         logger.exception("Failed to handle admin menu callback")
-        await _show_main_menu(
-            update, context, status_message="Не удалось обработать запрос. Попробуйте позже."
-        )
+        if update.callback_query:
+            await update.callback_query.answer(
+                "Что-то пошло не так. Нажми ещё раз, пожалуйста 💗",
+                show_alert=False,
+            )
+        await _show_main_menu(update, context)
 
 
 async def _handle_list_callback(
@@ -1157,11 +1176,12 @@ async def _handle_list_callback(
             return
     except Exception:
         logger.exception("Failed to handle admin list callback")
-        await _show_event_list(
-            update,
-            context,
-            status_message="Не удалось обработать запрос. Попробуйте позже.",
-        )
+        if update.callback_query:
+            await update.callback_query.answer(
+                "Что-то пошло не так. Нажми ещё раз, пожалуйста 💗",
+                show_alert=False,
+            )
+        await _show_event_list(update, context)
 
 
 async def _handle_nav_back(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1240,10 +1260,31 @@ async def handle_admin_callback(update: Update, context: ContextTypes.DEFAULT_TY
     if data.startswith("admin:new:"):
         await _handle_new_event_callback(update, context, data)
         return
-    match = re.match(r"^admin:ev:([^:]+):(.*)$", data)
-    if match:
-        event_id = match.group(1)
-        action = match.group(2)
+    if data.startswith("admin:ev:"):
+        match = re.match(r"^admin:ev:([^:]+):(.*)$", data)
+        if match:
+            event_id = match.group(1)
+            action = match.group(2)
+            await _handle_event_callback(update, context, event_id, action)
+        else:
+            await query.answer("Что-то пошло не так. Нажми ещё раз, пожалуйста 💗")
+        return
+    if data.startswith("admin:e:"):
+        parts = data.split(":", 3)
+        if len(parts) < 4:
+            await query.answer("Что-то пошло не так. Нажми ещё раз, пожалуйста 💗")
+            return
+        key = parts[2]
+        action = parts[3]
+        event_id = resolve_event_id(context, key)
+        if not event_id:
+            event_id = find_event_id_by_key_persistently(key)
+            if event_id:
+                map_event_key(context, key, event_id)
+        if not event_id:
+            await query.answer("Событие не найдено", show_alert=True)
+            await _show_event_list(update, context, status_message="Событие не найдено.")
+            return
         await _handle_event_callback(update, context, event_id, action)
         return
     if data == "nav:back":
