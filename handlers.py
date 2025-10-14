@@ -128,28 +128,6 @@ def _build_restart_reply_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup([[RESTART_BUTTON_TEXT]], resize_keyboard=True)
 
 
-async def _ensure_restart_reply_keyboard(
-    context: ContextTypes.DEFAULT_TYPE, chat_id: int, *, force: bool = False
-) -> None:
-    keyboard_chats: set[int] | None = None
-    application = context.application
-    if application is not None:
-        keyboard_chats = application.bot_data.setdefault("restart_keyboard_chats", set())
-        if not force and chat_id in keyboard_chats:
-            return
-    try:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text="Если захочется начать диалог заново, нажмите кнопку под полем ввода.",
-            reply_markup=_build_restart_reply_keyboard(),
-        )
-    except Exception:
-        logger.debug("Failed to send restart reply keyboard", exc_info=True)
-    else:
-        if keyboard_chats is not None:
-            keyboard_chats.add(chat_id)
-
-
 def _keyboard_signature(markup: InlineKeyboardMarkup) -> tuple[tuple[tuple[str, str | None, str | None], ...], ...]:
     if not markup or not getattr(markup, "inline_keyboard", None):
         return ()
@@ -526,7 +504,6 @@ async def _enter_user_flow(
         context.user_data.clear()
         if restart_guard is not None:
             context.user_data["restart_in_progress"] = restart_guard
-    await _ensure_restart_reply_keyboard(context, chat_id, force=force_registration)
     _activate_event_payload(context, payload)
     _clear_global_feedback_flag(context, chat_id)
     _reset_user_input_state(context)
