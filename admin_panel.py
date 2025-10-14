@@ -103,7 +103,7 @@ def _clear_draft(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 def _clear_await(context: ContextTypes.DEFAULT_TYPE) -> None:
-    context.user_data["await"] = None
+    context.user_data.pop("await", None)
 
 
 async def _send_prompt_message(
@@ -184,10 +184,9 @@ async def _send_panel(
             )
             return
         except BadRequest as e:
-            if "can't be edited" in str(e).lower() or "not modified" in str(e).lower():
-                pass  # пойдём на создание нового
-            else:
-                raise
+            logger.debug("Falling back to new message after edit failure: %s", e)
+        except Exception:
+            logger.debug("Unexpected error while editing admin panel message", exc_info=True)
 
     # Иначе — просто отправляем новое сообщение
     chat = update.effective_chat
@@ -390,11 +389,11 @@ def _event_list_keyboard(
     rows: List[List[InlineKeyboardButton]] = []
     selectable_events = list(active_future) + list(cancelled)
     for event in selectable_events:
-        _ensure_event_key(context, event)
+        key = _ensure_event_key(context, event)
         rows.append(
             [
                 InlineKeyboardButton(
-                    event.event_id, callback_data=f"admin:list:pick:{event.event_id}"
+                    _event_button_label(event), callback_data=f"admin:list:pick:{key}"
                 )
             ]
         )
@@ -402,6 +401,18 @@ def _event_list_keyboard(
         rows.append([InlineKeyboardButton("🆕 Новое мероприятие", callback_data="admin:menu:new")])
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="admin:list:back")])
     return InlineKeyboardMarkup(_add_home_button(rows))
+
+
+def _event_button_label(event: Event) -> str:
+    title = (event.title or "Без названия").strip() or "Без названия"
+    title = " ".join(title.split())
+    dt = event.parsed_datetime
+    if dt:
+        local = dt.astimezone(ZoneInfo(event.timezone or TIMEZONE))
+        label = f"{title} • {local.strftime('%d.%m %H:%M')}"
+    else:
+        label = title
+    return label if len(label) <= 64 else f"{label[:61]}…"
 
 
 def _event_has_sheet(event: Event) -> bool:
@@ -885,6 +896,7 @@ async def _handle_event_callback(
     if update.callback_query and action != "open_sheet":
         await update.callback_query.answer()
         answered = True
+    _clear_await(context)
     if action == "back":
         _pop_entry(context)
         await _show_event_list(update, context)
@@ -1074,11 +1086,11 @@ async def _handle_menu_callback(
         answered = True
     await _close_wizard_panel(update, context)
     try:
+        _clear_await(context)
         if data == "admin:menu:new":
             if not await _ensure_no_active_event(update, context):
                 return
             _clear_draft(context)
-            _clear_await(context)
             _push_entry(context, "new")
             _set_wizard_step(context, WIZARD_STEP_TITLE)
             context.user_data["await"] = {"type": "wizard", "step": WIZARD_STEP_TITLE}
@@ -1086,7 +1098,6 @@ async def _handle_menu_callback(
             await _prompt_wizard_step(update, context)
             return
         if data == "admin:menu:list":
-            _clear_await(context)
             _push_entry(context, "list")
             await _show_event_list(update, context)
             return
@@ -1162,26 +1173,55 @@ async def _handle_list_callback(
     context: ContextTypes.DEFAULT_TYPE,
     data: str,
 ) -> None:
-    if update.callback_query:
-        await update.callback_query.answer()
+    query = update.callback_query
+    answered = False
     try:
+        _clear_await(context)
         if data == "admin:list:back":
+            if query and not answered:
+                await query.answer()
+                answered = True
             _pop_entry(context)
             await _show_main_menu(update, context)
             return
         if data.startswith("admin:list:pick:"):
-            event_id = data.split(":", 2)[2]
+            parts = data.split(":", 3)
+            if len(parts) < 4:
+                raise ValueError(f"invalid list pick callback: {data}")
+            key = parts[3]
+            event_id = resolve_event_id(context, key)
+            if not event_id:
+                event_id = find_event_id_by_key_persistently(key)
+                if event_id:
+                    map_event_key(context, key, event_id)
+            if not event_id:
+                if query:
+                    await query.answer(
+                        "Событие не найдено", show_alert=True
+                    )
+                    answered = True
+                await _show_event_list(
+                    update, context, status_message="Событие не найдено или устарело."
+                )
+                return
             _push_entry(context, "event", event_id=event_id)
             await _show_event_menu(update, context, event_id)
             return
     except Exception:
         logger.exception("Failed to handle admin list callback")
-        if update.callback_query:
-            await update.callback_query.answer(
+        if query and not answered:
+            await query.answer(
                 "Что-то пошло не так. Нажми ещё раз, пожалуйста 💗",
                 show_alert=False,
             )
+            answered = True
         await _show_event_list(update, context)
+    finally:
+        if query and not answered:
+            try:
+                await query.answer()
+            except Exception:
+                logger.debug("Failed to send default answer for list callback", exc_info=True)
 
 
 async def _handle_nav_back(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
