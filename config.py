@@ -14,6 +14,10 @@ ADMINS: Tuple[Dict[str, Any], ...] = (
         "chat_id": 7740254761,
         "username": "z_ivan89",
     },
+    {
+        "chat_id": 227239650,
+        "username": None,
+    },
 )
 
 
